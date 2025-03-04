@@ -1,10 +1,29 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any, Literal
+from pathlib import Path
+
+
+class CrawlerConfig(BaseModel):
+    """Configuration for the crawler"""
+    max_concurrent_requests: int = Field(default=5, gt=0)
+    max_queue_size: int = Field(default=100, gt=0)
+    request_delay: float = Field(default=0.5, ge=0)
+    timeout: int = Field(default=15, gt=0)
+    base_path: Path = Field(default=Path("output"))
+
+
+class IdeaPageInfo(BaseModel):
+    """Information about an idea page"""
+    idea_id: str
+    document_url: str
+    page_number: int
+    raw_data: Dict[str, Any]
 
 
 class CustomSearchParams(BaseModel):
+    """Parameters for search requests"""
     search: str = ""
-    pageIndex: int = 1
+    pageIndex: int = Field(default=1, gt=0)
     pageSize: Literal[10, 20, 30] = 10
     sortOption: Literal[0, 1] = 1
     culture: str = "fa-IR"
@@ -20,20 +39,13 @@ class ResultAttributes(BaseModel):
 
 class ResultItem(BaseModel):
     """Individual result item within a search result"""
-
-    Tags: List[str]
-    DisplayModifiedTime: str
-    AuthorProfileUrl: str
-    AuthorName: Optional[str] = None
-    Likes: int
-    Comments: int
-    Views: int
-    Title: str
-    Snippet: str
-    Description: Optional[str] = None
+    IdeaId: Optional[int] = None
     DocumentUrl: str
-    DocumentTypeName: str
-    Attributes: Dict[str, Any] = {}
+    Title: str
+    Description: Optional[str] = None
+    AuthorName: Optional[str] = None
+    DisplayModifiedTime: Optional[str] = None
+    raw_html: Optional[str] = None
 
 
 class SearchResult(BaseModel):
@@ -46,7 +58,7 @@ class SearchResult(BaseModel):
 
 class SearchResponse(BaseModel):
     """Response model for the custom search API"""
-
-    results: List[SearchResult]
+    results: List[ResultItem]
     totalHits: int
     more: bool
+    raw_html: Optional[str] = None
