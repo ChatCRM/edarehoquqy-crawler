@@ -1,161 +1,134 @@
-# edarehoquqy-crawler
+# HTML Processing and Indexing System
 
-![programming with claude](./assets/claude_programming.png)
+This system processes HTML files from a directory structure, parses them, generates embeddings, and indexes them in Elasticsearch. It uses asynchronous processing with queues and workers to efficiently handle large numbers of files.
 
-A Simple Crawler for edarehoquqy.eadl.ir - a legal opinions database.
+## Features
 
-## Project Description
-
-This project provides a web crawler for extracting legal opinions (نظریات مشورتی) from the edarehoquqy.eadl.ir website. It allows you to search for legal opinions with various parameters, supports pagination, and saves results as JSON files. The crawler is designed to be resumable, meaning it can continue from the last saved page in case of interruptions.
+- Asynchronous processing with queues and workers
+- Rate limiting and concurrency control
+- Error handling and retries
+- Configurable number of workers and queue sizes
+- Elasticsearch integration with vector search support
+- OpenAI embeddings integration
 
 ## Requirements
 
 - Python 3.12 or higher
-- Dependencies:
-  - beautifulsoup4 >= 4.13.3
-  - httpx >= 0.28.1
-  - pydantic >= 2.10.6
-  - pydantic-settings >= 2.8.1
+- Elasticsearch 8.x
+- OpenAI API key
 
-## How to Use
-
-### Installation
+## Installation
 
 1. Clone the repository:
+   ```bash
+   git clone https://github.com/yourusername/edarehoquqy-crawler.git
+   cd edarehoquqy-crawler
+   ```
+
+2. Create a virtual environment and install dependencies:
+   ```bash
+   python -m venv venv
+   source venv/bin/activate  # On Windows: venv\Scripts\activate
+   pip install -e .
+   ```
+
+3. Set up environment variables:
+   ```bash
+   cp .env.sample .env
+   ```
+   
+   Edit the `.env` file to include your OpenAI API key and Elasticsearch credentials:
+   ```
+   OPENAI_API_KEY=your_openai_api_key
+   ELASTICSEARCH_HOST=http://localhost:9200
+   ELASTICSEARCH_USERNAME=elastic
+   ELASTICSEARCH_PASSWORD=your_password
+   ```
+
+## Usage
+
+Run the processor with default settings:
 
 ```bash
-git clone https://github.com/your-username/edarehoquqy-crawler.git
-cd edarehoquqy-crawler
+python src/main.py
 ```
 
-2. Set up a virtual environment:
+### Command-line Arguments
+
+- `--output-dir`: Path to the output directory (default: "../output")
+- `--num-parser-workers`: Number of parser workers (default: 5)
+- `--num-embedding-workers`: Number of embedding workers (default: 3)
+- `--num-indexing-workers`: Number of indexing workers (default: 5)
+- `--parser-queue-size`: Size of the parser queue (default: 100)
+- `--embedding-queue-size`: Size of the embedding queue (default: 100)
+- `--indexing-queue-size`: Size of the indexing queue (default: 100)
+- `--elasticsearch-index`: Name of the Elasticsearch index (default: "parsed_content")
+- `--metadata-file`: Path to a JSON file containing metadata
+
+Example:
 
 ```bash
-python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
+python src/main.py --output-dir /path/to/output --num-parser-workers 10 --elasticsearch-index my_index --metadata-file metadata.json
 ```
 
-3. Install dependencies:
+## Directory Structure
 
-```bash
-pip install -e .
-```
-
-### Configuration
-
-Create a `.env` file in the project root with the following settings:
+The system expects the following directory structure:
 
 ```
-OUTPUT_PATH=./data
+output/
+  ├── id1/
+  │   └── id1.html
+  ├── id2/
+  │   └── id2.html
+  └── ...
 ```
 
-This will determine where crawled data is saved.
+Where each directory is named with an ID, and contains an HTML file with the same name.
 
-### Basic Usage
+## Customizing the Parser
 
-```python
-from src.handler import LegalOpinionsCrawler
+The current implementation includes a placeholder parser. To customize it, edit the `HTMLParser` class in `src/parser.py` to implement your specific parsing logic.
 
-# Initialize the crawler
-crawler = LegalOpinionsCrawler()
+## Metadata
 
-# Search with specific parameters
-results = crawler.crawl_all_results(
-    search_text="قانون مدنی",  # Optional: search term
-    page_size=10,              # Options: 10, 20, or 30
-    sort_option=1,             # Options: 0 or 1
-    from_date="1400/01/01",    # Optional: start date in Persian calendar
-    to_date="1402/12/29"       # Optional: end date in Persian calendar
-)
+You can provide additional metadata to be included in the indexed documents by passing a JSON file with the `--metadata-file` argument. The metadata will be merged with the document metadata.
 
-# Print number of results
-print(f"Found {len(results)} opinions")
+Example metadata.json:
+
+```json
+{
+  "source": "edarehoquqy",
+  "language": "fa",
+  "collection": "legal_opinions"
+}
 ```
 
-### Single Page Search
+## Elasticsearch Index
 
-```python
-from src._core.schemas import CustomSearchParams
-from src.handler import LegalOpinionsCrawler
+The system creates an Elasticsearch index with the following mapping:
 
-# Initialize the crawler
-crawler = LegalOpinionsCrawler()
-crawler.initialize_session()
-
-# Create search parameters
-params = CustomSearchParams(
-    search="قانون تجارت",
-    pageIndex=1,
-    pageSize=20
-)
-
-# Perform search
-response = crawler.search(params)
-
-if response:
-    print(f"Page 1 contains {len(response.results)} results")
-    print(f"Total hits: {response.totalHits}")
+```json
+{
+  "mappings": {
+    "properties": {
+      "question": {"type": "text"},
+      "answer": {"type": "text"},
+      "date": {"type": "date"},
+      "metadata": {"type": "object"},
+      "embedding": {
+        "type": "dense_vector",
+        "dims": 3072,
+        "index": true,
+        "similarity": "cosine"
+      }
+    }
+  }
+}
 ```
 
-## Schema
+This mapping supports vector search using the `embedding` field.
 
-The crawler uses the following data models:
+## License
 
-### CustomSearchParams
-
-Parameters for searching legal opinions:
-
-```python
-class CustomSearchParams(BaseModel):
-    search: str = ""             # Search term
-    pageIndex: int = 1           # Page number
-    pageSize: Literal[10, 20, 30] = 10  # Results per page
-    sortOption: Literal[0, 1] = 1       # Sort method
-    culture: str = "fa-IR"       # Culture/locale
-    fromDate: str = ""           # Start date (e.g., "1400/01/01")
-    toDate: str = ""             # End date (e.g., "1402/12/29")
-    moduleId: int = 1286         # Module ID
-```
-
-### SearchResponse
-
-Results from a search:
-
-```python
-class SearchResponse(BaseModel):
-    results: List[SearchResult]  # Search results
-    totalHits: int               # Total number of results
-    more: bool                   # Whether more pages exist
-```
-
-### SearchResult
-
-Individual search result:
-
-```python
-class SearchResult(BaseModel):
-    DocumentUrl: str             # URL to the document
-    Title: str                   # Title of the result
-    Results: List[ResultItem]    # List of result items
-```
-
-### ResultItem
-
-Detailed information about a legal opinion:
-
-```python
-class ResultItem(BaseModel):
-    Tags: List[str]              # Tags associated with the opinion
-    DisplayModifiedTime: str     # Modification time
-    AuthorProfileUrl: str        # URL to author profile
-    AuthorName: Optional[str]    # Name of the author
-    Likes: int                   # Number of likes
-    Comments: int                # Number of comments
-    Views: int                   # Number of views
-    Title: str                   # Title of the opinion
-    Snippet: str                 # Short snippet/summary
-    Description: Optional[str]   # Full description
-    DocumentUrl: str             # URL to the document
-    DocumentTypeName: str        # Type of the document
-    Attributes: Dict[str, Any]   # Additional attributes
-```
+This project is licensed under the terms of the license included in the repository.
