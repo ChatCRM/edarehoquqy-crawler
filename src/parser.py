@@ -179,7 +179,7 @@ class DateHandler:
 
 class HTMLParser:
     """Parser for HTML files."""
-    def parse(self, html_content: str, file_id: str) -> ParsedContent:
+    async def parse(self, html_content: str, file_id: str) -> ParsedContent:
         """
         Parse HTML content and extract structured data.
         

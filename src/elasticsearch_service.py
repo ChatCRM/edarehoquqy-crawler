@@ -1,7 +1,6 @@
 import os
 import logging
 from typing import Dict, Any, List, Optional, Tuple
-from datetime import datetime
 from elasticsearch import AsyncElasticsearch
 from elasticsearch.helpers import async_bulk
 
@@ -16,7 +15,7 @@ class ElasticsearchService:
     def __init__(
         self,
         hosts: List[str] = None,
-        index_name: str = "ghavanin",
+        index_name: str = "edarehoquqy",
         username: str = None,
         password: str = None,
         timeout: int = 30,
@@ -37,10 +36,23 @@ class ElasticsearchService:
             retry_on_timeout: Whether to retry on timeout
             max_retries: Maximum number of retries for failed requests
         """
-        self.hosts = hosts or [os.environ.get("ELASTICSEARCH_HOST", "http://localhost:9200")]
+        # Check for ES_URL first, then fall back to ELASTICSEARCH_HOST
+        es_url = os.environ.get("ES_URL")
+        if es_url and not hosts:
+            self.hosts = [es_url]
+        else:
+            self.hosts = hosts or [os.environ.get("ELASTICSEARCH_HOST", "http://localhost:9200")]
+            
         self.index_name = index_name
-        self.username = username or os.environ.get("ELASTICSEARCH_USERNAME")
-        self.password = password or os.environ.get("ELASTICSEARCH_PASSWORD")
+        
+        # Check for ES_PASSWORD first, then fall back to ELASTICSEARCH_PASSWORD
+        es_password = os.environ.get("ES_PASSWORD")
+        if es_password and not password:
+            self.password = es_password
+        else:
+            self.password = password or os.environ.get("ELASTICSEARCH_PASSWORD")
+            
+        self.username = username or os.environ.get("ELASTICSEARCH_USERNAME", "elastic")
         
         self.timeout = timeout
         self.bulk_size = bulk_size
@@ -93,7 +105,7 @@ class ElasticsearchService:
                             "ef_construction": 200
                         }
                     },
-                    "id_ghavanin": {
+                    "id_edarehoquqy": {
                         "type": "keyword"
                     },
                     "metadata": {
@@ -168,7 +180,7 @@ class ElasticsearchService:
             "question": content.question,
             "answer": content.answer,
             "content": content.content,
-            "id_ghavanin": document_id,
+            "id_edarehoquqy": document_id,
             "metadata": content.metadata.model_dump(),
             "embedding": embedding
         }
@@ -176,7 +188,6 @@ class ElasticsearchService:
         # Add to bulk buffer
         self.bulk_buffer.append({
             "_index": self.index_name,
-            "_id": document_id,
             "_source": document
         })
         

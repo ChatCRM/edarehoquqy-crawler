@@ -5,6 +5,10 @@ from typing import Dict, Any
 import json
 from aiopath import AsyncPath
 import aiofiles
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 from src.processor import Processor
 
@@ -87,16 +91,16 @@ async def main(
 
 
 if __name__ == "__main__":
-    # Configuration variables
-    output_dir = "../output"
-    num_parser_workers = 5
-    num_embedding_workers = 3
-    num_indexing_workers = 5
-    parser_queue_size = 100
-    embedding_queue_size = 100
-    indexing_queue_size = 100
-    elasticsearch_index = "parsed_content"
-    metadata_file = None  # Set to a path if needed
+    # Configuration variables from environment variables with fallbacks
+    output_dir = os.environ.get("OUTPUT_DIR", "../output")
+    num_parser_workers = 50
+    num_embedding_workers = 50
+    num_indexing_workers = 50
+    parser_queue_size = 2500
+    embedding_queue_size = 2500
+    indexing_queue_size = 2500
+    elasticsearch_index = os.environ.get("ELASTICSEARCH_INDEX", "edarehoquqy")
+    metadata_file = os.environ.get("METADATA_FILE", None)
     
     try:
         asyncio.run(main(

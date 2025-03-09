@@ -188,9 +188,9 @@ class Processor:
         parser_queue_size: int = 100,
         embedding_queue_size: int = 100,
         indexing_queue_size: int = 100,
-        elasticsearch_index: str = "parsed_content",
+        elasticsearch_index: str = "edarehoquqy",
         metadata: Dict[str, Any] = None,
-        embedding_batch_size: int = 8,
+        embedding_batch_size: int = 50,
         indexing_batch_size: int = 50,
         max_batch_wait_time: float = 2.0,
     ):
@@ -313,19 +313,9 @@ class Processor:
                         await self.parser_queue.mark_completed(success=True)
                         continue
                     
-                    # Add metadata to the task
-                    task_metadata = self.metadata.copy()
-                    task_metadata.update({
-                        "file_id": task.file_id,
-                        "file_path": task.file_path,
-                        "processed_at": datetime.now().isoformat()
-                    })
-                    
                     # Parse HTML content
                     parsed_content = await self.parser.parse(task.html_content, task.file_id)
                     
-                    # Update metadata
-                    parsed_content.metadata.update(task_metadata)
                     
                     # Update task
                     task.parsed_content = parsed_content
@@ -519,6 +509,9 @@ class Processor:
             
             # Ensure Elasticsearch index exists
             await self.elasticsearch_service.ensure_index_exists()
+            
+            # Initialize the file manager
+            await self.file_manager.initialize()
             
             # Start workers
             parser_tasks = await self.start_parser_workers()

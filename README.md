@@ -34,42 +34,64 @@ This system processes HTML files from a directory structure, parses them, genera
 
 3. Set up environment variables:
    ```bash
-   cp .env.sample .env
+   cp .env.example .env
    ```
    
-   Edit the `.env` file to include your OpenAI API key and Elasticsearch credentials:
+   Edit the `.env` file to include your OpenAI API key, Elasticsearch credentials, and other configuration options:
    ```
-   OPENAI_API_KEY=your_openai_api_key
+   # Output directory
+   OUTPUT_DIR=../output
+
+   # Worker configuration
+   NUM_PARSER_WORKERS=5
+   NUM_EMBEDDING_WORKERS=3
+   NUM_INDEXING_WORKERS=5
+
+   # Queue sizes
+   PARSER_QUEUE_SIZE=100
+   EMBEDDING_QUEUE_SIZE=100
+   INDEXING_QUEUE_SIZE=100
+
+   # Elasticsearch configuration
+   ELASTICSEARCH_INDEX=edarehoquqy
    ELASTICSEARCH_HOST=http://localhost:9200
    ELASTICSEARCH_USERNAME=elastic
    ELASTICSEARCH_PASSWORD=your_password
+
+   # OpenAI API configuration for embeddings
+   OPENAI_API_KEY=your_openai_api_key
+
+   # Optional metadata file path
+   METADATA_FILE=
    ```
 
 ## Usage
 
-Run the processor with default settings:
+Run the processor with settings from your .env file:
 
 ```bash
-python src/main.py
+python -m src.main
 ```
 
-### Command-line Arguments
+The application will automatically load configuration from the .env file. You can override any setting by modifying the .env file.
 
-- `--output-dir`: Path to the output directory (default: "../output")
-- `--num-parser-workers`: Number of parser workers (default: 5)
-- `--num-embedding-workers`: Number of embedding workers (default: 3)
-- `--num-indexing-workers`: Number of indexing workers (default: 5)
-- `--parser-queue-size`: Size of the parser queue (default: 100)
-- `--embedding-queue-size`: Size of the embedding queue (default: 100)
-- `--indexing-queue-size`: Size of the indexing queue (default: 100)
-- `--elasticsearch-index`: Name of the Elasticsearch index (default: "parsed_content")
-- `--metadata-file`: Path to a JSON file containing metadata
+### Environment Variables
 
-Example:
+All configuration can be set through environment variables:
 
-```bash
-python src/main.py --output-dir /path/to/output --num-parser-workers 10 --elasticsearch-index my_index --metadata-file metadata.json
-```
+- `OUTPUT_DIR`: Path to the output directory (default: "../output")
+- `NUM_PARSER_WORKERS`: Number of parser workers (default: 5)
+- `NUM_EMBEDDING_WORKERS`: Number of embedding workers (default: 3)
+- `NUM_INDEXING_WORKERS`: Number of indexing workers (default: 5)
+- `PARSER_QUEUE_SIZE`: Size of the parser queue (default: 100)
+- `EMBEDDING_QUEUE_SIZE`: Size of the embedding queue (default: 100)
+- `INDEXING_QUEUE_SIZE`: Size of the indexing queue (default: 100)
+- `ELASTICSEARCH_INDEX`: Name of the Elasticsearch index (default: "edarehoquqy")
+- `ELASTICSEARCH_HOST`: Elasticsearch host URL (default: "http://localhost:9200")
+- `ELASTICSEARCH_USERNAME`: Elasticsearch username (optional)
+- `ELASTICSEARCH_PASSWORD`: Elasticsearch password (optional)
+- `OPENAI_API_KEY`: OpenAI API key for generating embeddings
+- `METADATA_FILE`: Path to a JSON file containing metadata (optional)
 
 ## Directory Structure
 
