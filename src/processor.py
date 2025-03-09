@@ -1,11 +1,11 @@
 import os
 import asyncio
 import logging
-from typing import Dict, Any, List, Optional, Tuple
-from pathlib import Path
+from typing import Dict, Any, List, Optional, Tuple, Set
+from aiopath import AsyncPath
 import time
 from datetime import datetime
-import json
+import aiofiles
 
 from src.transfer.file_manager import FileManager
 from src.parser import HTMLParser, ParsedContent
@@ -95,6 +95,85 @@ class ProcessingQueue:
     async def join(self) -> None:
         """Wait for all tasks to be processed."""
         await self.queue.join()
+    
+    def qsize(self) -> int:
+        """Get the current size of the queue."""
+        return self.queue.qsize()
+    
+    def empty(self) -> bool:
+        """Check if the queue is empty."""
+        return self.queue.empty()
+
+
+class BatchProcessor:
+    """Processor for batch operations."""
+    
+    def __init__(self, batch_size: int = 10, max_wait_time: float = 2.0):
+        """
+        Initialize a batch processor.
+        
+        Args:
+            batch_size: Maximum batch size
+            max_wait_time: Maximum time to wait for a batch to fill up (in seconds)
+        """
+        self.batch_size = batch_size
+        self.max_wait_time = max_wait_time
+        self.batch = []
+        self.batch_event = asyncio.Event()
+        self.lock = asyncio.Lock()
+        self.last_item_time = time.time()
+    
+    async def add_item(self, item: Any) -> None:
+        """
+        Add an item to the batch.
+        
+        Args:
+            item: Item to add
+        """
+        async with self.lock:
+            self.batch.append(item)
+            self.last_item_time = time.time()
+            
+            if len(self.batch) >= self.batch_size:
+                self.batch_event.set()
+    
+    async def get_batch(self) -> List[Any]:
+        """
+        Get the current batch and reset.
+        
+        Returns:
+            List[Any]: Current batch
+        """
+        async with self.lock:
+            batch = self.batch
+            self.batch = []
+            self.batch_event.clear()
+            return batch
+    
+    async def wait_for_batch(self) -> List[Any]:
+        """
+        Wait for a batch to be ready.
+        
+        Returns:
+            List[Any]: Ready batch
+        """
+        while True:
+            # Check if batch is ready
+            if len(self.batch) >= self.batch_size:
+                return await self.get_batch()
+            
+            # Check if we've waited long enough
+            time_since_last_item = time.time() - self.last_item_time
+            if self.batch and time_since_last_item >= self.max_wait_time:
+                return await self.get_batch()
+            
+            # Wait for batch event or timeout
+            try:
+                wait_time = max(0.1, min(self.max_wait_time - time_since_last_item, self.max_wait_time))
+                await asyncio.wait_for(self.batch_event.wait(), timeout=wait_time)
+            except asyncio.TimeoutError:
+                # Timeout, check batch again
+                pass
 
 
 class Processor:
@@ -111,6 +190,9 @@ class Processor:
         indexing_queue_size: int = 100,
         elasticsearch_index: str = "parsed_content",
         metadata: Dict[str, Any] = None,
+        embedding_batch_size: int = 8,
+        indexing_batch_size: int = 50,
+        max_batch_wait_time: float = 2.0,
     ):
         """
         Initialize the processor.
@@ -125,11 +207,17 @@ class Processor:
             indexing_queue_size: Size of the indexing queue
             elasticsearch_index: Name of the Elasticsearch index
             metadata: Additional metadata to include in parsed content
+            embedding_batch_size: Size of embedding batches
+            indexing_batch_size: Size of indexing batches
+            max_batch_wait_time: Maximum time to wait for a batch to fill up
         """
         self.file_manager = FileManager(output_dir=output_dir)
         self.parser = HTMLParser()
-        self.embedding_service = EmbeddingService()
-        self.elasticsearch_service = ElasticsearchService(index_name=elasticsearch_index)
+        self.embedding_service = EmbeddingService(batch_size=embedding_batch_size)
+        self.elasticsearch_service = ElasticsearchService(
+            index_name=elasticsearch_index,
+            bulk_size=indexing_batch_size
+        )
         
         self.num_parser_workers = num_parser_workers
         self.num_embedding_workers = num_embedding_workers
@@ -141,7 +229,29 @@ class Processor:
         
         self.metadata = metadata or {}
         
+        self.embedding_batch_processor = BatchProcessor(
+            batch_size=embedding_batch_size,
+            max_wait_time=max_batch_wait_time
+        )
+        
+        self.indexing_batch_processor = BatchProcessor(
+            batch_size=indexing_batch_size,
+            max_wait_time=max_batch_wait_time
+        )
+        
         self.stop_event = asyncio.Event()
+        self.processed_files = set()
+        self.failed_ids = set()  # Set to track failed IDs
+        self.output_dir = output_dir
+        self.stats = {
+            "total_files": 0,
+            "parsed_files": 0,
+            "embedded_files": 0,
+            "indexed_files": 0,
+            "error_files": 0,
+            "start_time": None,
+            "end_time": None
+        }
     
     async def start_parser_workers(self) -> List[asyncio.Task]:
         """
@@ -196,6 +306,13 @@ class Processor:
                 task = await self.parser_queue.get()
                 
                 try:
+                    # Skip if already processed
+                    if task.file_id in self.processed_files:
+                        logger.info(f"Skipping already processed file {task.file_id}")
+                        self.parser_queue.task_done()
+                        await self.parser_queue.mark_completed(success=True)
+                        continue
+                    
                     # Add metadata to the task
                     task_metadata = self.metadata.copy()
                     task_metadata.update({
@@ -213,13 +330,19 @@ class Processor:
                     # Update task
                     task.parsed_content = parsed_content
                     
-                    # Put task in embedding queue
-                    await self.embedding_queue.put(task)
+                    # Add to embedding batch processor
+                    await self.embedding_batch_processor.add_item(task)
+                    
+                    # Mark as processed
+                    self.processed_files.add(task.file_id)
+                    self.stats["parsed_files"] += 1
                     
                     await self.parser_queue.mark_completed(success=True)
                 except Exception as e:
                     logger.error(f"Error parsing HTML content for file {task.file_id}: {str(e)}")
                     task.error = f"Parsing error: {str(e)}"
+                    self.stats["error_files"] += 1
+                    self.failed_ids.add(task.file_id)  # Add to failed IDs
                     await self.parser_queue.mark_completed(success=False)
                 finally:
                     self.parser_queue.task_done()
@@ -241,28 +364,56 @@ class Processor:
         
         while not self.stop_event.is_set():
             try:
-                task = await self.embedding_queue.get()
+                # Wait for a batch of tasks
+                batch = await self.embedding_batch_processor.wait_for_batch()
+                
+                if not batch:
+                    # No tasks in batch, wait a bit
+                    await asyncio.sleep(0.1)
+                    continue
                 
                 try:
-                    if task.parsed_content is None:
-                        raise ValueError("Parsed content is None")
+                    # Prepare texts for batch embedding
+                    tasks_with_content = []
+                    texts = []
                     
-                    # Generate embedding
-                    embedding = await self.embedding_service.get_embedding(task.parsed_content.content)
+                    for task in batch:
+                        if task.parsed_content is None:
+                            logger.warning(f"Task {task.file_id} has no parsed content, skipping")
+                            self.failed_ids.add(task.file_id)  # Add to failed IDs
+                            continue
+                        
+                        tasks_with_content.append(task)
+                        texts.append(task.parsed_content.content)
                     
-                    # Update task
-                    task.embedding = embedding
+                    if not texts:
+                        logger.warning("No valid texts for embedding")
+                        continue
                     
-                    # Put task in indexing queue
-                    await self.indexing_queue.put(task)
+                    # Generate embeddings in batch
+                    embeddings = await self.embedding_service.process_texts_in_batches(texts)
                     
-                    await self.embedding_queue.mark_completed(success=True)
+                    # Update tasks with embeddings
+                    for i, task in enumerate(tasks_with_content):
+                        if i < len(embeddings):
+                            task.embedding = embeddings[i]
+                            
+                            # Add to indexing batch processor
+                            await self.indexing_batch_processor.add_item(task)
+                            
+                            # Update stats
+                            self.stats["embedded_files"] += 1
+                        else:
+                            logger.error(f"Missing embedding for task {task.file_id}")
+                            task.error = "Embedding error: Missing embedding in batch result"
+                            self.stats["error_files"] += 1
+                            self.failed_ids.add(task.file_id)  # Add to failed IDs
                 except Exception as e:
-                    logger.error(f"Error generating embedding for file {task.file_id}: {str(e)}")
-                    task.error = f"Embedding error: {str(e)}"
-                    await self.embedding_queue.mark_completed(success=False)
-                finally:
-                    self.embedding_queue.task_done()
+                    logger.error(f"Error generating embeddings for batch: {str(e)}")
+                    for task in batch:
+                        task.error = f"Embedding error: {str(e)}"
+                        self.stats["error_files"] += 1
+                        self.failed_ids.add(task.file_id)  # Add to failed IDs
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -281,39 +432,54 @@ class Processor:
         
         while not self.stop_event.is_set():
             try:
-                task = await self.indexing_queue.get()
+                # Wait for a batch of tasks
+                batch = await self.indexing_batch_processor.wait_for_batch()
+                
+                if not batch:
+                    # No tasks in batch, wait a bit
+                    await asyncio.sleep(0.1)
+                    continue
                 
                 try:
-                    if task.parsed_content is None:
-                        raise ValueError("Parsed content is None")
+                    # Prepare documents for bulk indexing
+                    documents = []
                     
-                    if task.embedding is None:
-                        raise ValueError("Embedding is None")
+                    for task in batch:
+                        if task.parsed_content is None or task.embedding is None:
+                            logger.warning(f"Task {task.file_id} missing parsed content or embedding, skipping")
+                            self.failed_ids.add(task.file_id)  # Add to failed IDs
+                            continue
+                        
+                        documents.append((task.file_id, task.parsed_content, task.embedding))
                     
-                    # Index document
-                    success = await self.elasticsearch_service.index_document(
-                        task.file_id,
-                        task.parsed_content,
-                        task.embedding
-                    )
+                    if not documents:
+                        logger.warning("No valid documents for indexing")
+                        continue
                     
-                    # Update task
-                    task.indexed = success
-                    task.completed_at = datetime.now()
+                    # Bulk index documents
+                    success = await self.elasticsearch_service.bulk_index_documents(documents)
                     
+                    # Update tasks
+                    for task in batch:
+                        task.indexed = success
+                        task.completed_at = datetime.now()
+                    
+                    # Update stats
                     if success:
-                        logger.info(f"Successfully processed file {task.file_id}")
+                        self.stats["indexed_files"] += len(documents)
+                        logger.info(f"Successfully indexed {len(documents)} documents")
                     else:
-                        logger.error(f"Failed to index document for file {task.file_id}")
-                        task.error = "Indexing error"
-                    
-                    await self.indexing_queue.mark_completed(success=success)
+                        logger.error(f"Failed to index {len(documents)} documents")
+                        self.stats["error_files"] += len(documents)
+                        # Add all document IDs to failed_ids
+                        for doc_id, _, _ in documents:
+                            self.failed_ids.add(doc_id)
                 except Exception as e:
-                    logger.error(f"Error indexing document for file {task.file_id}: {str(e)}")
-                    task.error = f"Indexing error: {str(e)}"
-                    await self.indexing_queue.mark_completed(success=False)
-                finally:
-                    self.indexing_queue.task_done()
+                    logger.error(f"Error indexing documents: {str(e)}")
+                    for task in batch:
+                        task.error = f"Indexing error: {str(e)}"
+                        self.stats["error_files"] += 1
+                        self.failed_ids.add(task.file_id)  # Add to failed IDs
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -321,9 +487,36 @@ class Processor:
         
         logger.info(f"Indexing worker {worker_id} stopped")
     
-    async def process_files(self) -> None:
-        """Process files from the output directory."""
+    async def write_failed_ids_to_file(self) -> None:
+        """
+        Write failed IDs to a file.
+        """
+        if not self.failed_ids:
+            logger.info("No failed IDs to write")
+            return
+        
+        failed_ids_file = AsyncPath(self.output_dir) / "failed_ids.txt"
+        logger.info(f"Writing {len(self.failed_ids)} failed IDs to {failed_ids_file}")
+        
         try:
+            async with await failed_ids_file.open("w", encoding="utf-8") as f:
+                for file_id in sorted(self.failed_ids):
+                    await f.write(f"{file_id}\n")
+            
+            logger.info(f"Successfully wrote failed IDs to {failed_ids_file}")
+        except Exception as e:
+            logger.error(f"Error writing failed IDs to file: {str(e)}")
+    
+    async def process_files(self) -> Dict[str, Any]:
+        """
+        Process files from the output directory.
+        
+        Returns:
+            Dict[str, Any]: Processing statistics
+        """
+        try:
+            self.stats["start_time"] = datetime.now()
+            
             # Ensure Elasticsearch index exists
             await self.elasticsearch_service.ensure_index_exists()
             
@@ -336,11 +529,17 @@ class Processor:
             async for file_id, file_path, html_content in self.file_manager.scan_directories():
                 task = ProcessingTask(file_id, file_path, html_content)
                 await self.parser_queue.put(task)
+                self.stats["total_files"] += 1
             
             # Wait for all queues to be processed
             await self.parser_queue.join()
-            await self.embedding_queue.join()
-            await self.indexing_queue.join()
+            
+            # Wait for any remaining batches to be processed
+            # Give some time for tasks to move through the pipeline
+            await asyncio.sleep(5)
+            
+            # Flush any remaining documents in Elasticsearch
+            await self.elasticsearch_service.flush_all()
             
             # Stop workers
             self.stop_event.set()
@@ -352,7 +551,26 @@ class Processor:
             # Wait for worker tasks to complete
             await asyncio.gather(*parser_tasks, *embedding_tasks, *indexing_tasks, return_exceptions=True)
             
-            logger.info("Processing completed")
+            # Write failed IDs to file
+            await self.write_failed_ids_to_file()
+            
+            self.stats["end_time"] = datetime.now()
+            processing_time = (self.stats["end_time"] - self.stats["start_time"]).total_seconds()
+            self.stats["processing_time_seconds"] = processing_time
+            self.stats["failed_ids_count"] = len(self.failed_ids)
+            
+            logger.info(f"Processing completed in {processing_time:.2f} seconds")
+            logger.info(f"Total files: {self.stats['total_files']}")
+            logger.info(f"Parsed files: {self.stats['parsed_files']}")
+            logger.info(f"Embedded files: {self.stats['embedded_files']}")
+            logger.info(f"Indexed files: {self.stats['indexed_files']}")
+            logger.info(f"Error files: {self.stats['error_files']}")
+            logger.info(f"Failed IDs: {len(self.failed_ids)}")
+            
+            return self.stats
         except Exception as e:
             logger.error(f"Error processing files: {str(e)}")
+            self.stats["error"] = str(e)
+            # Try to write failed IDs even if there's an error
+            await self.write_failed_ids_to_file()
             raise 

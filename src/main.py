@@ -1,10 +1,10 @@
 import os
 import asyncio
 import logging
-import argparse
 from typing import Dict, Any
 import json
-from pathlib import Path
+from aiopath import AsyncPath
+import aiofiles
 
 from src.processor import Processor
 
@@ -50,9 +50,14 @@ async def main(
     metadata = {}
     if metadata_file:
         try:
-            with open(metadata_file, "r") as f:
-                metadata = json.load(f)
-            logger.info(f"Loaded metadata from {metadata_file}")
+            metadata_path = AsyncPath(metadata_file)
+            if await metadata_path.exists():
+                async with await aiofiles.open(metadata_file, "r") as f:
+                    metadata_content = await f.read()
+                    metadata = json.loads(metadata_content)
+                logger.info(f"Loaded metadata from {metadata_file}")
+            else:
+                logger.warning(f"Metadata file {metadata_file} does not exist")
         except Exception as e:
             logger.error(f"Error loading metadata from {metadata_file}: {str(e)}")
     
@@ -70,35 +75,40 @@ async def main(
     )
     
     # Process files
-    await processor.process_files()
+    stats = await processor.process_files()
+    
+    # Log information about failed IDs
+    failed_ids_count = stats.get("failed_ids_count", 0)
+    if failed_ids_count > 0:
+        failed_ids_file = AsyncPath(output_dir) / "failed_ids.txt"
+        logger.info(f"There were {failed_ids_count} failed IDs. See {failed_ids_file} for details.")
+    else:
+        logger.info("All files were processed successfully.")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Process HTML files, extract content, generate embeddings, and index in Elasticsearch")
-    
-    parser.add_argument("--output-dir", type=str, default="../output", help="Path to the output directory")
-    parser.add_argument("--num-parser-workers", type=int, default=5, help="Number of parser workers")
-    parser.add_argument("--num-embedding-workers", type=int, default=3, help="Number of embedding workers")
-    parser.add_argument("--num-indexing-workers", type=int, default=5, help="Number of indexing workers")
-    parser.add_argument("--parser-queue-size", type=int, default=100, help="Size of the parser queue")
-    parser.add_argument("--embedding-queue-size", type=int, default=100, help="Size of the embedding queue")
-    parser.add_argument("--indexing-queue-size", type=int, default=100, help="Size of the indexing queue")
-    parser.add_argument("--elasticsearch-index", type=str, default="parsed_content", help="Name of the Elasticsearch index")
-    parser.add_argument("--metadata-file", type=str, help="Path to a JSON file containing metadata")
-    
-    args = parser.parse_args()
+    # Configuration variables
+    output_dir = "../output"
+    num_parser_workers = 5
+    num_embedding_workers = 3
+    num_indexing_workers = 5
+    parser_queue_size = 100
+    embedding_queue_size = 100
+    indexing_queue_size = 100
+    elasticsearch_index = "parsed_content"
+    metadata_file = None  # Set to a path if needed
     
     try:
         asyncio.run(main(
-            output_dir=args.output_dir,
-            num_parser_workers=args.num_parser_workers,
-            num_embedding_workers=args.num_embedding_workers,
-            num_indexing_workers=args.num_indexing_workers,
-            parser_queue_size=args.parser_queue_size,
-            embedding_queue_size=args.embedding_queue_size,
-            indexing_queue_size=args.indexing_queue_size,
-            elasticsearch_index=args.elasticsearch_index,
-            metadata_file=args.metadata_file,
+            output_dir=output_dir,
+            num_parser_workers=num_parser_workers,
+            num_embedding_workers=num_embedding_workers,
+            num_indexing_workers=num_indexing_workers,
+            parser_queue_size=parser_queue_size,
+            embedding_queue_size=embedding_queue_size,
+            indexing_queue_size=indexing_queue_size,
+            elasticsearch_index=elasticsearch_index,
+            metadata_file=metadata_file,
         ))
     except KeyboardInterrupt:
         logger.info("Process interrupted by user")

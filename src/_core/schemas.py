@@ -1,6 +1,6 @@
 from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any, Literal
-from pathlib import Path
+from aiopath import AsyncPath
 
 
 class CrawlerConfig(BaseModel):
@@ -9,7 +9,7 @@ class CrawlerConfig(BaseModel):
     max_queue_size: int = Field(default=100, gt=0)
     request_delay: float = Field(default=0.5, ge=0)
     timeout: int = Field(default=15, gt=0)
-    base_path: Path = Field(default=Path("output"))
+    base_path: AsyncPath = Field(default=AsyncPath("output"))
 
 
 class IdeaPageInfo(BaseModel):

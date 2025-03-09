@@ -1,6 +1,6 @@
 import os
 import asyncio
-from pathlib import Path
+from aiopath import AsyncPath
 from typing import List, Dict, Any, AsyncGenerator, Tuple
 import logging
 
@@ -22,38 +22,32 @@ class FileManager:
             output_dir: Path to the output directory
             max_concurrent_reads: Maximum number of concurrent file reads
         """
-        self.output_dir = Path(output_dir).resolve()
+        self.output_dir = AsyncPath(output_dir).resolve()
         self.semaphore = asyncio.Semaphore(max_concurrent_reads)
     
-    async def list_directories(self) -> List[Tuple[str, Path]]:
+    async def list_directories(self) -> List[Tuple[str, AsyncPath]]:
         """
         List all directories in the output directory.
         
         Returns:
-            List[Tuple[str, Path]]: List of (directory_id, directory_path) tuples
+            List[Tuple[str, AsyncPath]]: List of (directory_id, directory_path) tuples
         """
-        if not self.output_dir.exists():
+        if not await self.output_dir.exists():
             logger.error(f"Output directory {self.output_dir} does not exist")
             return []
         
         directories = []
         
-        # Use run_in_executor to avoid blocking the event loop
-        def _list_dirs():
-            result = []
-            for item in self.output_dir.iterdir():
-                if item.is_dir():
-                    dir_id = item.name
-                    result.append((dir_id, item))
-            return result
-        
-        loop = asyncio.get_event_loop()
-        directories = await loop.run_in_executor(None, _list_dirs)
+        # Use async iteration instead of run_in_executor
+        async for item in self.output_dir.iterdir():
+            if await item.is_dir():
+                dir_id = item.name
+                directories.append((dir_id, item))
         
         logger.info(f"Found {len(directories)} directories in {self.output_dir}")
         return directories
     
-    async def read_html_file(self, dir_id: str, dir_path: Path) -> Tuple[str, str, str]:
+    async def read_html_file(self, dir_id: str, dir_path: AsyncPath) -> Tuple[str, str, str]:
         """
         Read an HTML file from a directory.
         
@@ -71,16 +65,12 @@ class FileManager:
             file_id = dir_id
             file_path = dir_path / f"{file_id}.html"
             
-            if not file_path.exists():
+            if not await file_path.exists():
                 raise FileNotFoundError(f"HTML file {file_path} does not exist")
             
-            # Use run_in_executor to avoid blocking the event loop
-            def _read_file():
-                with open(file_path, "r", encoding="utf-8") as f:
-                    return f.read()
-            
-            loop = asyncio.get_event_loop()
-            content = await loop.run_in_executor(None, _read_file)
+            # Use async file reading
+            async with await file_path.open("r", encoding="utf-8") as f:
+                content = await f.read()
             
             return file_id, str(file_path), content
     

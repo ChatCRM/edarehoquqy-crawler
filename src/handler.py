@@ -4,7 +4,6 @@ import logging
 import json
 import aiofiles
 from aiopath import AsyncPath
-from pathlib import Path
 from typing import List, Dict, Any, Optional, Literal
 import asyncio
 import random
@@ -20,8 +19,8 @@ logger = logging.getLogger(__name__)
 
 class FileProcessor:
     """Handles file operations for the crawler"""
-    def __init__(self, base_path: Path):
-        self.base_path = AsyncPath(base_path)
+    def __init__(self, base_path: AsyncPath):
+        self.base_path = base_path
         self.main_pages_path = self.base_path / "main_pages"
         self.pages_path = self.base_path / "pages"
         self.links_file = self.base_path / "links.txt"
