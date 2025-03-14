@@ -4,7 +4,6 @@ import logging
 from typing import List, Dict, Any, Optional
 import time
 from openai import AsyncOpenAI
-from openai.types.create_embedding_response import CreateEmbeddingResponse
 import random
 
 logger = logging.getLogger(__name__)
@@ -18,9 +17,9 @@ class EmbeddingService:
         api_key: str = None,
         model: str = "text-embedding-3-large",
         max_retries: int = 4,
-        rate_limit: int = 60,  # Requests per minute
+        rate_limit: int = 20,  # Requests per minute
         timeout: int = 30,
-        batch_size: int = 10,  # Number of texts to batch in a single API call
+        batch_size: int = 1,  # Number of texts to batch in a single API call
     ):
         """
         Initialize the embedding service.
@@ -44,8 +43,8 @@ class EmbeddingService:
         
         # Initialize OpenAI client
         self.client = AsyncOpenAI(
-            base_url="https://api.avalai.ir/v1",
             api_key=self.api_key,
+            base_url="https://api.avalai.ir/v1",
             timeout=timeout
         )
         

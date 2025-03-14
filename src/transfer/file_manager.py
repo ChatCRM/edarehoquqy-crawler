@@ -68,7 +68,7 @@ class FileManager:
                 if line.strip():
                     # Extract the directory name from the full path
                     dir_path = AsyncPath(line.strip())
-                    dir_id = dir_path.name
+                    dir_id = str(dir_path).split('/')[-1]
                     directories.append((dir_id, dir_path))
                 
             logger.info(f"Found {len(directories)} directories using find command")
@@ -81,7 +81,7 @@ class FileManager:
                 try:
                     is_dir = await item.is_dir()
                     if is_dir:
-                        dir_id = item.name
+                        dir_id = str(item).split('/')[-1]
                         directories.append((dir_id, item))
                 except (PermissionError, OSError) as e:
                     logger.warning(f"Error accessing {item}: {str(e)}")

@@ -65,17 +65,12 @@ class MissingPagesChecker:
         self.max_concurrent_requests = max_concurrent_requests
         self.request_delay = request_delay
         
-        # Get Elasticsearch connection parameters from environment variables
-        self.es_host = os.getenv("ELASTIC_SEARCH_HOST")
-        self.es_username = os.getenv("ELASTIC_SEARCH_USERNAME")
-        self.es_password = os.getenv("ELASTIC_SEARCH_PASSWORD")
-        
         # Initialize services
         self.elasticsearch_service = ElasticsearchService(
             index_name=elasticsearch_index, 
-            hosts=self.es_host, 
-            username=self.es_username, 
-            password=self.es_password
+            hosts=os.getenv("ELASTIC_SEARCH_HOST"), 
+            username=os.getenv("ELASTIC_SEARCH_USERNAME"), 
+            password=os.getenv("ELASTIC_SEARCH_PASSWORD")
         )
         self.file_manager = FileManager(output_dir=output_dir)
         
@@ -128,7 +123,7 @@ class MissingPagesChecker:
                 # Look for JSON data in the HTML
                 json_match = re.search(r'(\{.*"results":\s*\[.*\].*\})', html_content)
                 if json_match:
-                    logger.debug(f"Found JSON data in {html_file.name}")
+                    logger.debug(f"Found JSON data in {str(html_file).split('/')[-1]}")
                     json_data = json.loads(json_match.group(1))
                     if "results" in json_data:
                         for result in json_data["results"]:
@@ -138,17 +133,17 @@ class MissingPagesChecker:
                             elif "DocumentUrl" in result and result["DocumentUrl"]:
                                 extracted_ids.add(result["DocumentUrl"])
                                 json_ids_found += 1
-                    logger.debug(f"Extracted {json_ids_found} IDs from JSON in {html_file.name}")
+                    logger.debug(f"Extracted {json_ids_found} IDs from JSON in {str(html_file).split('/')[-1]}")
             except Exception as e:
-                logger.debug(f"Failed to parse JSON from {html_file.name}: {str(e)}")
+                logger.debug(f"Failed to parse JSON from {str(html_file).split('/')[-1]}: {str(e)}")
             
             # If no IDs found via JSON, try to extract from HTML structure
             html_ids_found = 0
             if not extracted_ids:
-                logger.debug(f"No IDs found in JSON, trying HTML structure for {html_file.name}")
+                logger.debug(f"No IDs found in JSON, trying HTML structure for {str(html_file).split('/')[-1]}")
                 # Look for links that might contain IDs
                 links = soup.find_all("a", href=True)
-                logger.debug(f"Found {len(links)} links in {html_file.name}")
+                logger.debug(f"Found {len(links)} links in {str(html_file).split('/')[-1]}")
                 
                 for link in links:
                     href = link.get("href", "")
@@ -158,20 +153,20 @@ class MissingPagesChecker:
                         extracted_ids.add(id_match.group(1))
                         html_ids_found += 1
                 
-                logger.debug(f"Extracted {html_ids_found} IDs from HTML links in {html_file.name}")
+                logger.debug(f"Extracted {html_ids_found} IDs from HTML links in {str(html_file).split('/')[-1]}")
             
             # Try another approach if still no IDs found
             if not extracted_ids:
-                logger.debug(f"No IDs found in HTML links, trying direct text search for {html_file.name}")
+                logger.debug(f"No IDs found in HTML links, trying direct text search for {str(html_file).split('/')[-1]}")
                 # Look for IDs in the text
                 id_matches = re.findall(r'IdeaId[=:]\s*[\'"]?(\d+)[\'"]?', html_content)
                 for id_match in id_matches:
                     extracted_ids.add(id_match)
                 
-                logger.debug(f"Extracted {len(id_matches)} IDs from direct text search in {html_file.name}")
+                logger.debug(f"Extracted {len(id_matches)} IDs from direct text search in {str(html_file).split('/')[-1]}")
         
         except Exception as e:
-            logger.error(f"Error processing main page file {html_file.name}: {str(e)}")
+            logger.error(f"Error processing main page file {str(html_file).split('/')[-1]}: {str(e)}")
         
         return extracted_ids
     
@@ -206,7 +201,7 @@ class MissingPagesChecker:
         logger.info(f"Found {len(html_files)} main page HTML files")
         
         # Sort files by page number to process them in order
-        html_files.sort(key=lambda x: int(x.name.split('_')[1].split('.')[0]))
+        html_files.sort(key=lambda x: int(str(x).split('/')[-1].split('_')[1].split('.')[0]))
         
         # Process each HTML file to extract IDs
         processed_files = 0
@@ -214,10 +209,10 @@ class MissingPagesChecker:
         
         for html_file in html_files:
             try:
-                logger.info(f"Processing file {processed_files+1}/{total_files}: {html_file.name}")
+                logger.info(f"Processing file {processed_files+1}/{total_files}: {str(html_file).split('/')[-1]}")
                 file_ids = await self.extract_ids_from_html_file(html_file)
                 
-                logger.info(f"Extracted {len(file_ids)} IDs from {html_file.name}")
+                logger.info(f"Extracted {len(file_ids)} IDs from {str(html_file).split('/')[-1]}")
                 all_ids.update(file_ids)
                 processed_files += 1
                 
@@ -225,7 +220,7 @@ class MissingPagesChecker:
                 if processed_files % 100 == 0:
                     logger.info(f"Processed {processed_files}/{total_files} files, extracted {len(all_ids)} IDs so far")
             except Exception as e:
-                logger.error(f"Error processing file {html_file.name}: {str(e)}")
+                logger.error(f"Error processing file {str(html_file).split('/')[-1]}: {str(e)}")
         
         # If we couldn't extract IDs from HTML files, just return empty set instead of crawling
         if not all_ids:
@@ -348,6 +343,11 @@ class MissingPagesChecker:
         logger.info(f"Processing {len(missing_ids)} missing IDs")
         self.stats["missing_ids"] = len(missing_ids)
         
+        # Get Elasticsearch connection parameters from environment variables
+        es_host = os.getenv("ELASTIC_SEARCH_HOST") or os.getenv("ES_URL")
+        es_username = os.getenv("ELASTIC_SEARCH_USERNAME")
+        es_password = os.getenv("ELASTIC_SEARCH_PASSWORD")
+        
         # Initialize the processor
         try:
             processor = Processor(
@@ -356,9 +356,9 @@ class MissingPagesChecker:
                 num_embedding_workers=self.num_embedding_workers,
                 num_indexing_workers=self.num_indexing_workers,
                 elasticsearch_index=self.elasticsearch_index,
-                es_host=self.es_host,
-                es_username=self.es_username,
-                es_password=self.es_password
+                es_host=es_host,
+                es_username=es_username,
+                es_password=es_password
             )
         except Exception as e:
             logger.error(f"Failed to initialize processor: {str(e)}")
@@ -401,7 +401,8 @@ class MissingPagesChecker:
                 idea_dir = self.file_processor.pages_path / str(idea_id)
                 html_file = idea_dir / f"{idea_id}.html"
                 
-                if await AsyncPath(html_file).exists():
+                # Use exists() instead of directly accessing stat()
+                if await html_file.exists():
                     existing_files.append((idea_id, html_file))
                 else:
                     missing_files.append(idea_id)
@@ -716,9 +717,9 @@ async def main():
     # Configuration variables with hardcoded values
     output_dir = "/home/msc8/main_pages"
     elasticsearch_index = "edarehoquqy"
-    num_parser_workers = 50
-    num_embedding_workers = 50
-    num_indexing_workers = 50
+    num_parser_workers = 20
+    num_embedding_workers = 5 
+    num_indexing_workers = 20
     max_concurrent_requests = 5
     request_delay = 0.5
     

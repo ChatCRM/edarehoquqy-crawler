@@ -589,7 +589,7 @@ class LegalOpinionsCrawler(AsyncCrawlerClient):
         async for file_path in output_dir.glob(f"{pattern}*.json"):
             try:
                 # Extract page number from filename
-                filename = file_path.name
+                filename = str(file_path).split('/')[-1]
                 page_str = filename.split('_page')[1].split('.json')[0]
                 page_num = int(page_str)
                 last_page = max(last_page, page_num)

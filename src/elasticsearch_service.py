@@ -37,27 +37,14 @@ class ElasticsearchService:
             max_retries: Maximum number of retries for failed requests
         """
         # Check for ES_URL first, then fall back to ELASTICSEARCH_HOST
-        es_url = os.environ.get("ES_URL")
-        if es_url and not hosts:
-            self.hosts = [es_url]
-        elif hosts:
-            self.hosts = hosts
-        elif os.environ.get("ELASTICSEARCH_HOST"):
-            self.hosts = [os.environ.get("ELASTICSEARCH_HOST")]
-        else:
-            logger.error("No Elasticsearch host specified in environment variables or parameters")
-            raise ValueError("No Elasticsearch host specified. Please set ES_URL or ELASTICSEARCH_HOST in .env file")
+        self.hosts = hosts or [os.getenv("ELASTIC_SEARCH_HOST")]
             
         self.index_name = index_name
         
         # Check for ES_PASSWORD first, then fall back to ELASTICSEARCH_PASSWORD
-        es_password = os.environ.get("ES_PASSWORD")
-        if es_password and not password:
-            self.password = es_password
-        else:
-            self.password = password or os.environ.get("ELASTICSEARCH_PASSWORD")
+        self.password = password or os.environ.get("ELASTIC_SEARCH_PASSWORD")
             
-        self.username = username or os.environ.get("ELASTICSEARCH_USERNAME", "elastic")
+        self.username = username or os.environ.get("ELASTIC_SEARCH_USERNAME", "elastic")
         
         self.timeout = timeout
         self.bulk_size = bulk_size
