@@ -1,10 +1,11 @@
 import os
 import asyncio
 import logging
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple, Set
 import time
 from openai import AsyncOpenAI
 import random
+import tiktoken
 
 logger = logging.getLogger(__name__)
 
@@ -20,6 +21,7 @@ class EmbeddingService:
         rate_limit: int = 20,  # Requests per minute
         timeout: int = 30,
         batch_size: int = 1,  # Number of texts to batch in a single API call
+        max_tokens: int = 8192,  # Maximum token limit for the model
     ):
         """
         Initialize the embedding service.
@@ -31,6 +33,7 @@ class EmbeddingService:
             rate_limit: Maximum requests per minute
             timeout: Request timeout in seconds
             batch_size: Number of texts to batch in a single API call
+            max_tokens: Maximum token limit for the model
         """
         self.api_key = api_key or os.environ.get("OPENAI_API_KEY")
         if not self.api_key:
@@ -40,6 +43,7 @@ class EmbeddingService:
         self.max_retries = max_retries
         self.timeout = timeout
         self.batch_size = batch_size
+        self.max_tokens = max_tokens
         
         # Initialize OpenAI client
         self.client = AsyncOpenAI(
@@ -52,6 +56,33 @@ class EmbeddingService:
         self.semaphore = asyncio.Semaphore(rate_limit // 6 + 1)  # Allow bursts but average to rate limit
         self.rate_limit_period = 60 / rate_limit  # Time between requests in seconds
         self.last_request_time = 0
+        
+        # Set to store IDs of documents that exceed token limit
+        self.oversized_document_ids = set()
+        
+        # Initialize tokenizer
+        try:
+            self.tokenizer = tiktoken.encoding_for_model("gpt-3.5-turbo")
+        except:
+            # Fallback to cl100k_base if model-specific encoding is not available
+            self.tokenizer = tiktoken.get_encoding("cl100k_base")
+    
+    def estimate_token_count(self, text: str) -> int:
+        """
+        Estimate the number of tokens in a text.
+        
+        Args:
+            text: The text to estimate tokens for
+            
+        Returns:
+            int: Estimated token count
+        """
+        if not text:
+            return 0
+        
+        # Use the tokenizer to count tokens
+        tokens = self.tokenizer.encode(text)
+        return len(tokens)
     
     async def get_embedding(self, text: str) -> List[float]:
         """
@@ -63,6 +94,12 @@ class EmbeddingService:
         Returns:
             List[float]: The embedding vector
         """
+        # Check if text exceeds token limit
+        token_count = self.estimate_token_count(text)
+        if token_count > self.max_tokens:
+            logger.warning(f"Text exceeds token limit ({token_count} > {self.max_tokens})")
+            raise ValueError(f"Text exceeds token limit ({token_count} > {self.max_tokens})")
+        
         async with self.semaphore:
             # Rate limiting
             now = asyncio.get_event_loop().time()
@@ -106,6 +143,13 @@ class EmbeddingService:
         if not texts:
             return []
         
+        # Check if any text exceeds token limit
+        for i, text in enumerate(texts):
+            token_count = self.estimate_token_count(text)
+            if token_count > self.max_tokens:
+                logger.warning(f"Text at index {i} exceeds token limit ({token_count} > {self.max_tokens})")
+                raise ValueError(f"Text at index {i} exceeds token limit ({token_count} > {self.max_tokens})")
+        
         async with self.semaphore:
             # Rate limiting
             now = asyncio.get_event_loop().time()
@@ -138,25 +182,97 @@ class EmbeddingService:
             
             raise Exception("Failed to get batch embeddings after maximum retries")
     
-    async def process_texts_in_batches(self, texts: List[str]) -> List[List[float]]:
+    async def process_texts_in_batches(self, texts: List[str], document_ids: Optional[List[str]] = None) -> Tuple[List[List[float]], List[int]]:
         """
         Process a list of texts in batches to get embeddings.
         
         Args:
             texts: List of texts to embed
+            document_ids: Optional list of document IDs corresponding to the texts
             
         Returns:
-            List[List[float]]: List of embedding vectors
+            Tuple[List[List[float]], List[int]]: Tuple of (embedding vectors, indices of skipped documents)
         """
         if not texts:
-            return []
+            return [], []
         
         results = []
+        skipped_indices = []
+        
+        # Check if we have document IDs
+        has_doc_ids = document_ids is not None and len(document_ids) == len(texts)
         
         # Process in batches
         for i in range(0, len(texts), self.batch_size):
             batch = texts[i:i + self.batch_size]
-            batch_embeddings = await self.get_embeddings_batch(batch)
-            results.extend(batch_embeddings)
+            batch_indices = list(range(i, min(i + self.batch_size, len(texts))))
+            
+            # Filter out texts that exceed token limit
+            valid_texts = []
+            valid_indices = []
+            
+            for j, text in enumerate(batch):
+                original_index = batch_indices[j]
+                token_count = self.estimate_token_count(text)
+                
+                if token_count > self.max_tokens:
+                    logger.warning(f"Document at index {original_index} exceeds token limit ({token_count} > {self.max_tokens})")
+                    skipped_indices.append(original_index)
+                    
+                    # Add to oversized document IDs if we have document IDs
+                    if has_doc_ids:
+                        doc_id = document_ids[original_index]
+                        self.oversized_document_ids.add(doc_id)
+                        logger.warning(f"Added document ID {doc_id} to oversized documents list (token count: {token_count})")
+                else:
+                    valid_texts.append(text)
+                    valid_indices.append(original_index)
+            
+            # Skip this batch if all texts exceed token limit
+            if not valid_texts:
+                continue
+            
+            try:
+                # Get embeddings for valid texts
+                batch_embeddings = await self.get_embeddings_batch(valid_texts)
+                
+                # Add embeddings to results at the correct indices
+                for embedding_idx, original_idx in enumerate(valid_indices):
+                    # Extend results list if needed
+                    while len(results) <= original_idx:
+                        results.append(None)
+                    
+                    results[original_idx] = batch_embeddings[embedding_idx]
+            except Exception as e:
+                logger.error(f"Error processing batch: {str(e)}")
+                # Mark all indices in this batch as skipped
+                skipped_indices.extend(valid_indices)
         
-        return results 
+        # Remove None values from results (these are skipped documents)
+        results = [r for r in results if r is not None]
+        
+        return results, skipped_indices
+    
+    async def save_oversized_document_ids(self, output_path: str) -> None:
+        """
+        Save the IDs of documents that exceed the token limit to a file.
+        
+        Args:
+            output_path: Path to save the file
+        """
+        if not self.oversized_document_ids:
+            logger.info("No oversized document IDs to save")
+            return
+        
+        try:
+            # Create directory if it doesn't exist
+            os.makedirs(os.path.dirname(output_path), exist_ok=True)
+            
+            # Write IDs to file
+            with open(output_path, "w", encoding="utf-8") as f:
+                for doc_id in sorted(self.oversized_document_ids):
+                    f.write(f"{doc_id}\n")
+            
+            logger.info(f"Saved {len(self.oversized_document_ids)} oversized document IDs to {output_path}")
+        except Exception as e:
+            logger.error(f"Error saving oversized document IDs: {str(e)}") 

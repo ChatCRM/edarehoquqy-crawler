@@ -717,11 +717,11 @@ async def main():
     # Configuration variables with hardcoded values
     output_dir = "/home/msc8/main_pages"
     elasticsearch_index = "edarehoquqy"
-    num_parser_workers = 20
-    num_embedding_workers = 5 
-    num_indexing_workers = 20
-    max_concurrent_requests = 5
-    request_delay = 0.5
+    num_parser_workers = 10
+    num_embedding_workers = 3
+    num_indexing_workers = 5
+    max_concurrent_requests = 3
+    request_delay = 1.0
     
     try:
         # Create the checker

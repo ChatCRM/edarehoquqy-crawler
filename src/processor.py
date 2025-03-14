@@ -196,6 +196,7 @@ class Processor:
         es_host: str = None,
         es_username: str = None,
         es_password: str = None,
+        max_tokens: int = 8192,  # Maximum token limit for the embedding model
     ):
         """
         Initialize the processor.
@@ -216,10 +217,11 @@ class Processor:
             es_host: Elasticsearch host
             es_username: Elasticsearch username
             es_password: Elasticsearch password
+            max_tokens: Maximum token limit for the embedding model
         """
         self.file_manager = FileManager(output_dir=output_dir)
         self.parser = HTMLParser()
-        self.embedding_service = EmbeddingService(batch_size=embedding_batch_size)
+        self.embedding_service = EmbeddingService(batch_size=embedding_batch_size, max_tokens=max_tokens)
         self.elasticsearch_service = ElasticsearchService(
             index_name=elasticsearch_index,
             bulk_size=indexing_batch_size,
@@ -258,6 +260,7 @@ class Processor:
             "embedded_files": 0,
             "indexed_files": 0,
             "error_files": 0,
+            "oversized_documents": 0,  # Count of documents exceeding token limit
             "start_time": None,
             "end_time": None
         }
@@ -375,6 +378,7 @@ class Processor:
                     # Prepare texts for batch embedding
                     tasks_with_content = []
                     texts = []
+                    document_ids = []
                     
                     for task in batch:
                         if task.parsed_content is None:
@@ -384,17 +388,24 @@ class Processor:
                         
                         tasks_with_content.append(task)
                         texts.append(task.parsed_content.content)
+                        document_ids.append(task.file_id)
                     
                     if not texts:
                         logger.warning("No valid texts for embedding")
                         continue
                     
-                    # Generate embeddings in batch
-                    embeddings = await self.embedding_service.process_texts_in_batches(texts)
+                    # Generate embeddings in batch with document IDs for tracking oversized documents
+                    embeddings, skipped_indices = await self.embedding_service.process_texts_in_batches(texts, document_ids)
                     
                     # Update tasks with embeddings
                     for i, task in enumerate(tasks_with_content):
-                        if i < len(embeddings):
+                        if i in skipped_indices:
+                            # This document was skipped due to token limit or other error
+                            logger.warning(f"Document {task.file_id} was skipped during embedding")
+                            task.error = "Embedding error: Document exceeds token limit or other embedding error"
+                            self.stats["error_files"] += 1
+                            self.failed_ids.add(task.file_id)  # Add to failed IDs
+                        elif i < len(embeddings):
                             task.embedding = embeddings[i]
                             
                             # Add to indexing batch processor
@@ -455,26 +466,47 @@ class Processor:
                         logger.warning("No valid documents for indexing")
                         continue
                     
-                    # Bulk index documents
-                    success = await self.elasticsearch_service.bulk_index_documents(documents)
-                    
-                    # Update tasks
-                    for task in batch:
-                        task.indexed = success
-                        task.completed_at = datetime.now()
-                    
-                    # Update stats
-                    if success:
-                        self.stats["indexed_files"] += len(documents)
-                        logger.info(f"Successfully indexed {len(documents)} documents")
-                    else:
-                        logger.error(f"Failed to index {len(documents)} documents")
-                        self.stats["error_files"] += len(documents)
-                        # Add all document IDs to failed_ids
-                        for doc_id, _, _ in documents:
-                            self.failed_ids.add(doc_id)
+                    # Bulk index documents with retry logic
+                    max_attempts = 3
+                    for attempt in range(1, max_attempts + 1):
+                        try:
+                            # Bulk index documents
+                            success = await self.elasticsearch_service.bulk_index_documents(documents)
+                            
+                            if success:
+                                # Update tasks
+                                for task in batch:
+                                    task.indexed = True
+                                    task.completed_at = datetime.now()
+                                
+                                # Update stats
+                                self.stats["indexed_files"] += len(documents)
+                                logger.info(f"Successfully indexed {len(documents)} documents")
+                                break
+                            else:
+                                if attempt < max_attempts:
+                                    retry_delay = 5 * attempt  # Exponential backoff
+                                    logger.warning(f"Failed to index {len(documents)} documents, retrying in {retry_delay} seconds (attempt {attempt}/{max_attempts})")
+                                    await asyncio.sleep(retry_delay)
+                                else:
+                                    logger.error(f"Failed to index {len(documents)} documents after {max_attempts} attempts")
+                                    self.stats["error_files"] += len(documents)
+                                    # Add all document IDs to failed_ids
+                                    for doc_id, _, _ in documents:
+                                        self.failed_ids.add(doc_id)
+                        except Exception as e:
+                            if attempt < max_attempts:
+                                retry_delay = 5 * attempt  # Exponential backoff
+                                logger.warning(f"Error indexing documents, retrying in {retry_delay} seconds (attempt {attempt}/{max_attempts}): {str(e)}")
+                                await asyncio.sleep(retry_delay)
+                            else:
+                                logger.error(f"Error indexing documents after {max_attempts} attempts: {str(e)}")
+                                for task in batch:
+                                    task.error = f"Indexing error: {str(e)}"
+                                    self.stats["error_files"] += 1
+                                    self.failed_ids.add(task.file_id)  # Add to failed IDs
                 except Exception as e:
-                    logger.error(f"Error indexing documents: {str(e)}")
+                    logger.error(f"Error preparing documents for indexing: {str(e)}")
                     for task in batch:
                         task.error = f"Indexing error: {str(e)}"
                         self.stats["error_files"] += 1
@@ -543,6 +575,13 @@ class Processor:
             # Flush any remaining documents in Elasticsearch
             await self.elasticsearch_service.flush_all()
             
+            # Save oversized document IDs to file
+            output_path = os.path.join(self.output_dir, "to_be_chunked.txt")
+            await self.embedding_service.save_oversized_document_ids(output_path)
+            
+            # Update stats with oversized document count
+            self.stats["oversized_documents"] = len(self.embedding_service.oversized_document_ids)
+            
             # Stop workers
             self.stop_event.set()
             
@@ -568,6 +607,7 @@ class Processor:
             logger.info(f"Indexed files: {self.stats['indexed_files']}")
             logger.info(f"Error files: {self.stats['error_files']}")
             logger.info(f"Failed IDs: {len(self.failed_ids)}")
+            logger.info(f"Oversized documents: {self.stats['oversized_documents']}")
             
             return self.stats
         except Exception as e:
@@ -575,4 +615,10 @@ class Processor:
             self.stats["error"] = str(e)
             # Try to write failed IDs even if there's an error
             await self.write_failed_ids_to_file()
+            # Try to save oversized document IDs even if there's an error
+            try:
+                output_path = os.path.join(self.output_dir, "to_be_chunked.txt")
+                await self.embedding_service.save_oversized_document_ids(output_path)
+            except Exception as save_error:
+                logger.error(f"Error saving oversized document IDs: {str(save_error)}")
             raise 

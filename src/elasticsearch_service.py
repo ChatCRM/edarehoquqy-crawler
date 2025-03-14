@@ -1,5 +1,6 @@
 import os
 import logging
+import asyncio
 from typing import Dict, Any, List, Optional, Tuple
 from elasticsearch import AsyncElasticsearch
 from elasticsearch.helpers import async_bulk
@@ -18,10 +19,10 @@ class ElasticsearchService:
         index_name: str = "edarehoquqy",
         username: str = None,
         password: str = None,
-        timeout: int = 30,
+        timeout: int = 60,  # Increased from 30 to 60 seconds
         bulk_size: int = 50,  # Number of documents to bulk insert at once
         retry_on_timeout: bool = True,
-        max_retries: int = 4,
+        max_retries: int = 6,  # Increased from 4 to 6
     ):
         """
         Initialize the Elasticsearch service.
@@ -57,7 +58,8 @@ class ElasticsearchService:
             basic_auth=(self.username, self.password) if self.username and self.password else None,
             request_timeout=self.timeout,
             retry_on_timeout=self.retry_on_timeout,
-            max_retries=self.max_retries
+            max_retries=self.max_retries,
+            retry_on_status=[429, 500, 502, 503, 504]  # Add retry on specific HTTP status codes
         )
         
         # Bulk operation buffer
@@ -199,34 +201,69 @@ class ElasticsearchService:
         if not self.bulk_buffer:
             return True
         
-        try:
-            # Make a copy of the buffer and clear it
-            documents_to_index = self.bulk_buffer.copy()
-            self.bulk_buffer = []
-            
-            # Use the async_bulk helper
-            success, errors = await async_bulk(
-                client=self.client,
-                actions=documents_to_index,
-                stats_only=False,
-                raise_on_error=False
-            )
-            
-            if errors:
-                logger.error(f"Bulk indexing had {len(errors)} errors")
-                # Log the first few errors
-                for i, error in enumerate(errors[:3]):
-                    logger.error(f"Error {i+1}: {error}")
+        # Make a copy of the buffer and clear it
+        documents_to_index = self.bulk_buffer.copy()
+        self.bulk_buffer = []
+        
+        max_attempts = 3
+        current_attempt = 0
+        
+        while current_attempt < max_attempts:
+            try:
+                current_attempt += 1
                 
-                # Return partial success
-                return len(errors) < len(documents_to_index)
-            else:
-                logger.info(f"Successfully bulk indexed {success} documents")
-                return True
+                # Use the async_bulk helper
+                success, errors = await async_bulk(
+                    client=self.client,
+                    actions=documents_to_index,
+                    stats_only=False,
+                    raise_on_error=False,
+                    max_retries=self.max_retries,
+                    initial_backoff=2,  # Start with a 2-second backoff
+                    max_backoff=60      # Maximum backoff of 60 seconds
+                )
                 
-        except Exception as e:
-            logger.error(f"Error in bulk indexing: {str(e)}")
-            return False
+                if errors:
+                    logger.error(f"Bulk indexing had {len(errors)} errors")
+                    # Log the first few errors
+                    for i, error in enumerate(errors[:3]):
+                        logger.error(f"Error {i+1}: {error}")
+                    
+                    # If this was the last attempt, return partial success
+                    if current_attempt >= max_attempts:
+                        logger.warning(f"Giving up after {max_attempts} attempts")
+                        return len(errors) < len(documents_to_index)
+                    
+                    # Otherwise, retry with the failed documents
+                    failed_ids = set()
+                    for error in errors:
+                        if 'index' in error and '_id' in error['index']:
+                            failed_ids.add(error['index']['_id'])
+                    
+                    # Filter out successful documents and retry only the failed ones
+                    documents_to_index = [doc for doc in documents_to_index 
+                                         if doc.get('_id', '') in failed_ids]
+                    
+                    logger.info(f"Retrying {len(documents_to_index)} failed documents (attempt {current_attempt}/{max_attempts})")
+                    await asyncio.sleep(2 * current_attempt)  # Exponential backoff
+                else:
+                    logger.info(f"Successfully bulk indexed {success} documents")
+                    return True
+                    
+            except Exception as e:
+                logger.error(f"Error in bulk indexing (attempt {current_attempt}/{max_attempts}): {str(e)}")
+                
+                # If this was the last attempt, return failure
+                if current_attempt >= max_attempts:
+                    logger.warning(f"Giving up after {max_attempts} attempts")
+                    return False
+                
+                # Otherwise, wait and retry
+                retry_delay = 5 * current_attempt  # Exponential backoff
+                logger.info(f"Retrying bulk indexing in {retry_delay} seconds")
+                await asyncio.sleep(retry_delay)
+        
+        return False
     
     async def flush_all(self) -> bool:
         """
@@ -247,25 +284,47 @@ class ElasticsearchService:
         Returns:
             bool: True if all documents were indexed successfully, False otherwise
         """
-        # Prepare all documents at once
-        for doc_id, content, embedding in documents:
-            document = {
-                "question": content.question,
-                "answer": content.answer,
-                "content": content.content,
-                "id_ghavanin": doc_id,
-                "metadata": content.metadata.model_dump(),
-                "embedding": embedding
-            }
+        if not documents:
+            return True
             
-            self.bulk_buffer.append({
-                "_index": self.index_name,
-                "_id": doc_id,
-                "_source": document
-            })
+        # Process documents in smaller chunks to avoid timeouts
+        chunk_size = min(self.bulk_size, 20)  # Use smaller chunks for better reliability
+        chunks = [documents[i:i + chunk_size] for i in range(0, len(documents), chunk_size)]
         
-        # Flush the buffer
-        return await self.flush_all()
+        logger.info(f"Processing {len(documents)} documents in {len(chunks)} chunks of up to {chunk_size} documents each")
+        
+        all_success = True
+        for i, chunk in enumerate(chunks):
+            # Prepare all documents in the chunk
+            for doc_id, content, embedding in chunk:
+                document = {
+                    "question": content.question,
+                    "answer": content.answer,
+                    "content": content.content,
+                    "id_edarehoquqy": doc_id,
+                    "metadata": content.metadata.model_dump(),
+                    "embedding": embedding
+                }
+                
+                self.bulk_buffer.append({
+                    "_index": self.index_name,
+                    "_id": doc_id,
+                    "_source": document
+                })
+            
+            # Flush the buffer for this chunk
+            chunk_success = await self._flush_bulk_buffer()
+            if not chunk_success:
+                all_success = False
+                logger.error(f"Failed to index chunk {i+1}/{len(chunks)}")
+            else:
+                logger.info(f"Successfully indexed chunk {i+1}/{len(chunks)}")
+            
+            # Add a small delay between chunks to avoid overwhelming the server
+            if i < len(chunks) - 1:  # Don't sleep after the last chunk
+                await asyncio.sleep(1)
+        
+        return all_success
     
     async def search_by_vector(self, embedding: List[float], k: int = 5) -> List[Dict[str, Any]]:
         """
