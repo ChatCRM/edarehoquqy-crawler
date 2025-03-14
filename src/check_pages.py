@@ -6,12 +6,18 @@ from typing import Set, List, Dict, Any, Optional, Tuple
 import os
 import json
 from datetime import datetime
+from bs4 import BeautifulSoup
+import re
+from dotenv import load_dotenv
+
 
 from src.handler import LegalOpinionsCrawler, FileProcessor
 from src._core.schemas import CrawlerConfig, IdeaPageInfo, CustomSearchParams, ResultItem
 from src.elasticsearch_service import ElasticsearchService
 from src.processor import Processor, ProcessingTask
 from src.transfer.file_manager import FileManager
+
+load_dotenv()
 
 # Configure logging
 logging.basicConfig(
@@ -59,8 +65,18 @@ class MissingPagesChecker:
         self.max_concurrent_requests = max_concurrent_requests
         self.request_delay = request_delay
         
+        # Get Elasticsearch connection parameters from environment variables
+        self.es_host = os.getenv("ELASTIC_SEARCH_HOST")
+        self.es_username = os.getenv("ELASTIC_SEARCH_USERNAME")
+        self.es_password = os.getenv("ELASTIC_SEARCH_PASSWORD")
+        
         # Initialize services
-        self.elasticsearch_service = ElasticsearchService(index_name=elasticsearch_index)
+        self.elasticsearch_service = ElasticsearchService(
+            index_name=elasticsearch_index, 
+            hosts=self.es_host, 
+            username=self.es_username, 
+            password=self.es_password
+        )
         self.file_manager = FileManager(output_dir=output_dir)
         
         # Initialize crawler
@@ -94,8 +110,6 @@ class MissingPagesChecker:
         Returns:
             Set[str]: Set of extracted IDs
         """
-        from bs4 import BeautifulSoup
-        import re
         
         extracted_ids = set()
         
@@ -109,30 +123,52 @@ class MissingPagesChecker:
             
             # Try to extract IDs from the HTML
             # First, try to parse as JSON response
+            json_ids_found = 0
             try:
                 # Look for JSON data in the HTML
                 json_match = re.search(r'(\{.*"results":\s*\[.*\].*\})', html_content)
                 if json_match:
+                    logger.debug(f"Found JSON data in {html_file.name}")
                     json_data = json.loads(json_match.group(1))
                     if "results" in json_data:
                         for result in json_data["results"]:
                             if "IdeaId" in result and result["IdeaId"]:
                                 extracted_ids.add(str(result["IdeaId"]))
+                                json_ids_found += 1
                             elif "DocumentUrl" in result and result["DocumentUrl"]:
                                 extracted_ids.add(result["DocumentUrl"])
+                                json_ids_found += 1
+                    logger.debug(f"Extracted {json_ids_found} IDs from JSON in {html_file.name}")
             except Exception as e:
                 logger.debug(f"Failed to parse JSON from {html_file.name}: {str(e)}")
             
             # If no IDs found via JSON, try to extract from HTML structure
+            html_ids_found = 0
             if not extracted_ids:
+                logger.debug(f"No IDs found in JSON, trying HTML structure for {html_file.name}")
                 # Look for links that might contain IDs
                 links = soup.find_all("a", href=True)
+                logger.debug(f"Found {len(links)} links in {html_file.name}")
+                
                 for link in links:
                     href = link.get("href", "")
                     # Extract IdeaId from URL
                     id_match = re.search(r'IdeaId=(\d+)', href)
                     if id_match:
                         extracted_ids.add(id_match.group(1))
+                        html_ids_found += 1
+                
+                logger.debug(f"Extracted {html_ids_found} IDs from HTML links in {html_file.name}")
+            
+            # Try another approach if still no IDs found
+            if not extracted_ids:
+                logger.debug(f"No IDs found in HTML links, trying direct text search for {html_file.name}")
+                # Look for IDs in the text
+                id_matches = re.findall(r'IdeaId[=:]\s*[\'"]?(\d+)[\'"]?', html_content)
+                for id_match in id_matches:
+                    extracted_ids.add(id_match)
+                
+                logger.debug(f"Extracted {len(id_matches)} IDs from direct text search in {html_file.name}")
         
         except Exception as e:
             logger.error(f"Error processing main page file {html_file.name}: {str(e)}")
@@ -153,31 +189,51 @@ class MissingPagesChecker:
         await self.file_processor.initialize()
         
         # Path to main pages directory
-        main_pages_path = AsyncPath(self.output_dir) / "main_pages"
+        main_pages_path = AsyncPath(self.output_dir)
         
         if not await main_pages_path.exists():
             logger.error(f"Main pages directory {main_pages_path} does not exist")
             return all_ids
         
         # Get all HTML files in the main_pages directory
-        html_files = [f for f in await main_pages_path.glob("*.html")]
+        html_files = []
+        pattern = "page_*.html"
+        logger.info(f"Searching for HTML files with pattern: {pattern}")
+        
+        async for f in main_pages_path.glob(pattern):
+            html_files.append(f)
+        
         logger.info(f"Found {len(html_files)} main page HTML files")
         
+        # Sort files by page number to process them in order
+        html_files.sort(key=lambda x: int(x.name.split('_')[1].split('.')[0]))
+        
         # Process each HTML file to extract IDs
+        processed_files = 0
+        total_files = len(html_files)
+        
         for html_file in html_files:
-            file_ids = await self.extract_ids_from_html_file(html_file)
-            all_ids.update(file_ids)
-            
-            # Log progress periodically
-            if len(all_ids) % 1000 == 0:
-                logger.info(f"Extracted {len(all_ids)} IDs so far")
+            try:
+                logger.info(f"Processing file {processed_files+1}/{total_files}: {html_file.name}")
+                file_ids = await self.extract_ids_from_html_file(html_file)
+                
+                logger.info(f"Extracted {len(file_ids)} IDs from {html_file.name}")
+                all_ids.update(file_ids)
+                processed_files += 1
+                
+                # Log progress periodically
+                if processed_files % 100 == 0:
+                    logger.info(f"Processed {processed_files}/{total_files} files, extracted {len(all_ids)} IDs so far")
+            except Exception as e:
+                logger.error(f"Error processing file {html_file.name}: {str(e)}")
         
-        # If we couldn't extract IDs from HTML files, fall back to crawling
+        # If we couldn't extract IDs from HTML files, just return empty set instead of crawling
         if not all_ids:
-            logger.warning("Could not extract IDs from HTML files, falling back to crawling")
-            return await self._crawl_main_pages_for_ids()
+            logger.warning("Could not extract IDs from HTML files. No IDs found to process.")
+            return all_ids
         
-        logger.info(f"Found {len(all_ids)} total IDs from main pages")
+        logger.info(f"Completed processing {processed_files}/{total_files} files")
+        logger.info(f"Found {len(all_ids)} total IDs from {processed_files} main pages")
         self.stats["total_ids"] = len(all_ids)
         return all_ids
     
@@ -271,54 +327,86 @@ class MissingPagesChecker:
             
         except Exception as e:
             logger.error(f"Error getting indexed IDs from Elasticsearch: {str(e)}")
+            logger.warning("Continuing without Elasticsearch connection. Will process all IDs.")
+            self.stats["indexed_ids"] = 0
             return indexed_ids
     
-    async def process_missing_ids(self, missing_ids: Set[str]) -> None:
+    async def process_missing_ids(self, missing_ids: Set[str]) -> Set[str]:
         """
         Process missing IDs.
         
         Args:
             missing_ids: Set of missing IDs
+            
+        Returns:
+            Set[str]: Set of failed IDs
         """
         if not missing_ids:
             logger.info("No missing IDs to process")
-            return
+            return set()
         
         logger.info(f"Processing {len(missing_ids)} missing IDs")
         self.stats["missing_ids"] = len(missing_ids)
         
         # Initialize the processor
-        processor = Processor(
-            output_dir=self.output_dir,
-            num_parser_workers=self.num_parser_workers,
-            num_embedding_workers=self.num_embedding_workers,
-            num_indexing_workers=self.num_indexing_workers,
-            elasticsearch_index=self.elasticsearch_index
-        )
+        try:
+            processor = Processor(
+                output_dir=self.output_dir,
+                num_parser_workers=self.num_parser_workers,
+                num_embedding_workers=self.num_embedding_workers,
+                num_indexing_workers=self.num_indexing_workers,
+                elasticsearch_index=self.elasticsearch_index,
+                es_host=self.es_host,
+                es_username=self.es_username,
+                es_password=self.es_password
+            )
+        except Exception as e:
+            logger.error(f"Failed to initialize processor: {str(e)}")
+            logger.warning("Will continue with file extraction only, without Elasticsearch indexing")
+            processor = None
         
         # Initialize the file manager
-        await self.file_manager.initialize()
+        try:
+            await self.file_manager.initialize()
+        except Exception as e:
+            logger.error(f"Failed to initialize file manager: {str(e)}")
+            return missing_ids  # Return all IDs as failed
         
-        # Start workers
-        parser_tasks = await processor.start_parser_workers()
-        embedding_tasks = await processor.start_embedding_workers()
-        indexing_tasks = await processor.start_indexing_workers()
+        # Start workers if processor is available
+        parser_tasks = []
+        embedding_tasks = []
+        indexing_tasks = []
+        
+        if processor:
+            try:
+                parser_tasks = await processor.start_parser_workers()
+                embedding_tasks = await processor.start_embedding_workers()
+                indexing_tasks = await processor.start_indexing_workers()
+            except Exception as e:
+                logger.error(f"Failed to start processor workers: {str(e)}")
+                logger.warning("Will continue with file extraction only, without processing")
+                processor = None
         
         # Process each missing ID
         processed_count = 0
         failed_count = 0
+        failed_ids = set()  # Track which specific IDs failed
         
         # First, check if the HTML files already exist in the pages directory
         existing_files = []
         missing_files = []
         
         for idea_id in missing_ids:
-            idea_dir = self.file_processor.pages_path / str(idea_id)
-            html_file = idea_dir / f"{idea_id}.html"
-            
-            if await AsyncPath(html_file).exists():
-                existing_files.append((idea_id, html_file))
-            else:
+            try:
+                idea_dir = self.file_processor.pages_path / str(idea_id)
+                html_file = idea_dir / f"{idea_id}.html"
+                
+                if await AsyncPath(html_file).exists():
+                    existing_files.append((idea_id, html_file))
+                else:
+                    missing_files.append(idea_id)
+            except Exception as e:
+                logger.error(f"Error checking file existence for ID {idea_id}: {str(e)}")
                 missing_files.append(idea_id)
         
         logger.info(f"Found {len(existing_files)} existing HTML files and {len(missing_files)} missing files")
@@ -330,11 +418,14 @@ class MissingPagesChecker:
                 async with aiofiles.open(html_file, "r", encoding="utf-8") as f:
                     html_content = await f.read()
                 
-                # Create a processing task
-                task = ProcessingTask(idea_id, str(html_file), html_content)
+                # If processor is available, add to queue for processing
+                if processor:
+                    # Create a processing task
+                    task = ProcessingTask(idea_id, str(html_file), html_content)
+                    
+                    # Add the task to the parser queue
+                    await processor.parser_queue.put(task)
                 
-                # Add the task to the parser queue
-                await processor.parser_queue.put(task)
                 processed_count += 1
                 
                 # Log progress
@@ -344,14 +435,23 @@ class MissingPagesChecker:
             except Exception as e:
                 logger.error(f"Error processing existing file for ID {idea_id}: {str(e)}")
                 failed_count += 1
+                failed_ids.add(idea_id)  # Add to failed IDs set
         
         # Initialize the crawler session if we need to fetch missing files
         if missing_files:
             logger.info(f"Initializing crawler session to fetch {len(missing_files)} missing files")
-            if not await self.crawler.initialize_session():
-                logger.error("Failed to initialize crawler session, skipping missing files")
+            try:
+                if not await self.crawler.initialize_session():
+                    logger.error("Failed to initialize crawler session, skipping missing files")
+                    for idea_id in missing_files:
+                        failed_count += 1
+                        failed_ids.add(idea_id)  # Add to failed IDs set
+                    missing_files = []
+            except Exception as e:
+                logger.error(f"Error initializing crawler session: {str(e)}")
                 for idea_id in missing_files:
                     failed_count += 1
+                    failed_ids.add(idea_id)  # Add to failed IDs set
                 missing_files = []
         
         # Process missing files
@@ -363,6 +463,7 @@ class MissingPagesChecker:
                 if not html_content:
                     logger.error(f"Failed to fetch HTML content for ID {idea_id}")
                     failed_count += 1
+                    failed_ids.add(idea_id)  # Add to failed IDs set
                     continue
                 
                 # Save the HTML content
@@ -372,11 +473,14 @@ class MissingPagesChecker:
                 async with aiofiles.open(html_file, "w", encoding="utf-8") as f:
                     await f.write(html_content)
                 
-                # Create a processing task
-                task = ProcessingTask(idea_id, str(html_file), html_content)
+                # If processor is available, add to queue for processing
+                if processor:
+                    # Create a processing task
+                    task = ProcessingTask(idea_id, str(html_file), html_content)
+                    
+                    # Add the task to the parser queue
+                    await processor.parser_queue.put(task)
                 
-                # Add the task to the parser queue
-                await processor.parser_queue.put(task)
                 processed_count += 1
                 
                 # Log progress
@@ -389,32 +493,61 @@ class MissingPagesChecker:
             except Exception as e:
                 logger.error(f"Error processing ID {idea_id}: {str(e)}")
                 failed_count += 1
+                failed_ids.add(idea_id)  # Add to failed IDs set
         
-        # Wait for all queues to be processed
-        logger.info("Waiting for all queued tasks to complete")
-        await processor.parser_queue.join()
-        
-        # Wait for any remaining batches to be processed
-        await asyncio.sleep(5)
-        
-        # Flush any remaining documents in Elasticsearch
-        await processor.elasticsearch_service.flush_all()
-        
-        # Stop workers
-        processor.stop_event.set()
-        
-        # Cancel worker tasks
-        for task in parser_tasks + embedding_tasks + indexing_tasks:
-            task.cancel()
-        
-        # Wait for worker tasks to complete
-        await asyncio.gather(*parser_tasks, *embedding_tasks, *indexing_tasks, return_exceptions=True)
+        # Wait for all queues to be processed if processor is available
+        if processor:
+            try:
+                logger.info("Waiting for all queued tasks to complete")
+                await processor.parser_queue.join()
+                
+                # Wait for any remaining batches to be processed
+                await asyncio.sleep(5)
+                
+                # Flush any remaining documents in Elasticsearch
+                await processor.elasticsearch_service.flush_all()
+                
+                # Stop workers
+                processor.stop_event.set()
+                
+                # Cancel worker tasks
+                for task in parser_tasks + embedding_tasks + indexing_tasks:
+                    task.cancel()
+                
+                # Wait for worker tasks to complete
+                await asyncio.gather(*parser_tasks, *embedding_tasks, *indexing_tasks, return_exceptions=True)
+            except Exception as e:
+                logger.error(f"Error waiting for processor tasks to complete: {str(e)}")
         
         # Update stats
         self.stats["processed_ids"] = processed_count
         self.stats["failed_ids"] = failed_count
         
         logger.info(f"Processed {processed_count} missing IDs, failed {failed_count} IDs")
+        
+        # Return the set of failed IDs
+        return failed_ids
+    
+    async def save_failed_ids(self, failed_ids: Set[str], filename: str = "new_failed_ids.txt") -> None:
+        """
+        Save failed IDs to a file.
+        
+        Args:
+            failed_ids: Set of failed IDs
+            filename: Name of the file to save to
+        """
+        if not failed_ids:
+            logger.info("No failed IDs to save")
+            return
+            
+        file_path = AsyncPath(self.output_dir) / filename
+        try:
+            async with aiofiles.open(file_path, "w", encoding="utf-8") as f:
+                for idea_id in sorted(failed_ids):
+                    await f.write(f"{idea_id}\n")
+            logger.info(f"Saved {len(failed_ids)} failed IDs to {file_path}")
+        except Exception as e:
+            logger.error(f"Error saving failed IDs to {file_path}: {str(e)}")
     
     async def check_and_process(self) -> Dict[str, Any]:
         """
@@ -424,30 +557,141 @@ class MissingPagesChecker:
             Dict[str, Any]: Processing statistics
         """
         self.stats["start_time"] = datetime.now()
+        failed_ids_first_phase = set()
+        failed_ids_second_phase = set()
+        elasticsearch_available = True
         
         try:
+            # PHASE 1: Process existing files
+            logger.info("=== PHASE 1: Processing existing files ===")
+            
             # Get all IDs from main pages
-            all_ids = await self.get_all_ids_from_main_pages()
+            all_ids_first_phase = await self.get_all_ids_from_main_pages()
             
             # Get indexed IDs from Elasticsearch
-            indexed_ids = await self.get_indexed_ids_from_elasticsearch()
+            try:
+                indexed_ids_first_phase = await self.get_indexed_ids_from_elasticsearch()
+                if not indexed_ids_first_phase:
+                    logger.warning("No indexed IDs found in Elasticsearch or connection failed.")
+                    elasticsearch_available = False
+            except Exception as e:
+                logger.error(f"Failed to connect to Elasticsearch: {str(e)}")
+                logger.warning("Continuing without Elasticsearch. Will process all IDs.")
+                indexed_ids_first_phase = set()
+                elasticsearch_available = False
             
             # Find missing IDs
-            missing_ids = all_ids - indexed_ids
+            if elasticsearch_available:
+                missing_ids_first_phase = all_ids_first_phase - indexed_ids_first_phase
+                logger.info(f"Found {len(missing_ids_first_phase)} missing IDs out of {len(all_ids_first_phase)} total IDs")
+            else:
+                # If Elasticsearch is not available, process all IDs
+                missing_ids_first_phase = all_ids_first_phase
+                logger.info(f"Elasticsearch not available. Processing all {len(all_ids_first_phase)} IDs")
             
             # Process missing IDs
-            await self.process_missing_ids(missing_ids)
+            if missing_ids_first_phase:
+                logger.info(f"Processing {len(missing_ids_first_phase)} missing IDs in Phase 1")
+                
+                # Store original failed count
+                original_failed_count = self.stats.get("failed_ids", 0)
+                
+                # Process the missing IDs
+                failed_ids_first_phase = await self.process_missing_ids(missing_ids_first_phase)
+                
+                # Calculate failed IDs from this phase
+                new_failed_count = self.stats.get("failed_ids", 0) - original_failed_count
+                
+                # Log the number of failed IDs
+                logger.info(f"Phase 1: Failed to process {len(failed_ids_first_phase)} IDs")
+                
+                # Save failed IDs from first phase
+                await self.save_failed_ids(failed_ids_first_phase, "failed_ids_phase1.txt")
+            else:
+                logger.info("No missing IDs found in Phase 1")
             
+            # PHASE 2: Verification phase - only if Elasticsearch is available
+            if elasticsearch_available:
+                logger.info("=== PHASE 2: Verification phase ===")
+                
+                # Crawl main pages again to get all IDs
+                logger.info("Crawling main pages again to verify all IDs are processed")
+                all_ids_second_phase = await self._crawl_main_pages_for_ids()
+                
+                # Get updated indexed IDs from Elasticsearch
+                try:
+                    indexed_ids_second_phase = await self.get_indexed_ids_from_elasticsearch()
+                except Exception as e:
+                    logger.error(f"Failed to connect to Elasticsearch in Phase 2: {str(e)}")
+                    logger.warning("Skipping Phase 2 verification.")
+                    indexed_ids_second_phase = set()
+                    all_ids_second_phase = set()
+                
+                # Find any IDs that are still missing
+                missing_ids_second_phase = all_ids_second_phase - indexed_ids_second_phase
+                
+                # Remove IDs that failed in the first phase (we already know they failed)
+                missing_ids_second_phase = missing_ids_second_phase - failed_ids_first_phase
+                
+                # Process any newly discovered missing IDs
+                if missing_ids_second_phase:
+                    logger.info(f"Found {len(missing_ids_second_phase)} additional missing IDs in Phase 2")
+                    
+                    # Store original stats to calculate differences
+                    original_processed = self.stats.get("processed_ids", 0)
+                    original_failed = self.stats.get("failed_ids", 0)
+                    
+                    # Process the newly discovered missing IDs
+                    failed_ids_second_phase = await self.process_missing_ids(missing_ids_second_phase)
+                    
+                    # Calculate new failures from this phase
+                    new_failed = self.stats.get("failed_ids", 0) - original_failed
+                    new_processed = self.stats.get("processed_ids", 0) - original_processed
+                    
+                    logger.info(f"Phase 2: Processed {new_processed} additional IDs, failed {len(failed_ids_second_phase)}")
+                    
+                    # Save failed IDs from second phase
+                    await self.save_failed_ids(failed_ids_second_phase, "failed_ids_phase2.txt")
+                else:
+                    logger.info("No additional missing IDs found in Phase 2")
+            else:
+                logger.info("Skipping Phase 2 verification due to Elasticsearch unavailability")
+                all_ids_second_phase = set()
+                missing_ids_second_phase = set()
+            
+            # Save all failed IDs from both phases
+            all_failed_ids = failed_ids_first_phase.union(failed_ids_second_phase)
+            await self.save_failed_ids(all_failed_ids, "all_failed_ids.txt")
+            
+            # Update final stats
             self.stats["end_time"] = datetime.now()
             processing_time = (self.stats["end_time"] - self.stats["start_time"]).total_seconds()
             self.stats["processing_time_seconds"] = processing_time
+            self.stats["total_ids_phase1"] = len(all_ids_first_phase)
+            self.stats["total_ids_phase2"] = len(all_ids_second_phase)
+            self.stats["missing_ids_phase1"] = len(missing_ids_first_phase)
+            self.stats["missing_ids_phase2"] = len(missing_ids_second_phase)
+            self.stats["failed_ids_phase1"] = len(failed_ids_first_phase)
+            self.stats["failed_ids_phase2"] = len(failed_ids_second_phase)
+            self.stats["total_failed_ids"] = len(all_failed_ids)
+            self.stats["elasticsearch_available"] = elasticsearch_available
             
+            # Log final stats
+            logger.info("=== Processing Summary ===")
             logger.info(f"Processing completed in {processing_time:.2f} seconds")
-            logger.info(f"Total IDs: {self.stats['total_ids']}")
-            logger.info(f"Indexed IDs: {self.stats['indexed_ids']}")
-            logger.info(f"Missing IDs: {self.stats['missing_ids']}")
-            logger.info(f"Processed IDs: {self.stats['processed_ids']}")
-            logger.info(f"Failed IDs: {self.stats['failed_ids']}")
+            logger.info(f"Elasticsearch available: {elasticsearch_available}")
+            logger.info(f"Phase 1 - Total IDs: {self.stats['total_ids_phase1']}")
+            if elasticsearch_available:
+                logger.info(f"Phase 1 - Indexed IDs: {len(indexed_ids_first_phase)}")
+            logger.info(f"Phase 1 - Missing IDs: {self.stats['missing_ids_phase1']}")
+            logger.info(f"Phase 1 - Failed IDs: {self.stats['failed_ids_phase1']}")
+            if elasticsearch_available:
+                logger.info(f"Phase 2 - Total IDs: {self.stats['total_ids_phase2']}")
+                logger.info(f"Phase 2 - Indexed IDs: {len(indexed_ids_second_phase)}")
+                logger.info(f"Phase 2 - Additional Missing IDs: {self.stats['missing_ids_phase2']}")
+                logger.info(f"Phase 2 - Failed IDs: {self.stats['failed_ids_phase2']}")
+            logger.info(f"Total Processed IDs: {self.stats.get('processed_ids', 0)}")
+            logger.info(f"Total Failed IDs: {self.stats['total_failed_ids']}")
             
             return self.stats
         except Exception as e:
@@ -456,14 +700,21 @@ class MissingPagesChecker:
             raise
         finally:
             # Close connections
-            await self.elasticsearch_service.close()
-            await self.crawler.close()
+            try:
+                await self.elasticsearch_service.close()
+            except Exception as e:
+                logger.error(f"Error closing Elasticsearch connection: {str(e)}")
+            
+            try:
+                await self.crawler.close()
+            except Exception as e:
+                logger.error(f"Error closing crawler connection: {str(e)}")
 
 
 async def main():
     """Main entry point for the script."""
     # Configuration variables with hardcoded values
-    output_dir = "../output"
+    output_dir = "/home/msc8/main_pages"
     elasticsearch_index = "edarehoquqy"
     num_parser_workers = 50
     num_embedding_workers = 50
@@ -471,26 +722,32 @@ async def main():
     max_concurrent_requests = 5
     request_delay = 0.5
     
-    # Create the checker
-    checker = MissingPagesChecker(
-        output_dir=output_dir,
-        elasticsearch_index=elasticsearch_index,
-        num_parser_workers=num_parser_workers,
-        num_embedding_workers=num_embedding_workers,
-        num_indexing_workers=num_indexing_workers,
-        max_concurrent_requests=max_concurrent_requests,
-        request_delay=request_delay
-    )
-    
-    # Check and process missing pages
-    stats = await checker.check_and_process()
-    
-    # Save stats to file
-    stats_file = AsyncPath(output_dir) / "check_pages_stats.json"
-    async with aiofiles.open(stats_file, "w", encoding="utf-8") as f:
-        await f.write(json.dumps(stats, default=str, indent=2))
-    
-    logger.info(f"Stats saved to {stats_file}")
+    try:
+        # Create the checker
+        checker = MissingPagesChecker(
+            output_dir=output_dir,
+            elasticsearch_index=elasticsearch_index,
+            num_parser_workers=num_parser_workers,
+            num_embedding_workers=num_embedding_workers,
+            num_indexing_workers=num_indexing_workers,
+            max_concurrent_requests=max_concurrent_requests,
+            request_delay=request_delay
+        )
+        
+        # Check and process missing pages
+        stats = await checker.check_and_process()
+        
+        # Save stats to file
+        stats_file = AsyncPath(output_dir) / "check_pages_stats.json"
+        async with aiofiles.open(stats_file, "w", encoding="utf-8") as f:
+            await f.write(json.dumps(stats, default=str, indent=2))
+        
+        logger.info(f"Stats saved to {stats_file}")
+    except Exception as e:
+        logger.error(f"Error in main function: {str(e)}")
+        # Continue with a more detailed error message
+        import traceback
+        logger.error(f"Detailed error: {traceback.format_exc()}")
 
 
 if __name__ == "__main__":
@@ -500,7 +757,8 @@ if __name__ == "__main__":
         logger.info("Process interrupted by user")
     except Exception as e:
         logger.error(f"Error running checker: {str(e)}")
-        raise
+        import traceback
+        logger.error(f"Detailed error: {traceback.format_exc()}")
 
 
 

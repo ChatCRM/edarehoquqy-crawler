@@ -193,6 +193,9 @@ class Processor:
         embedding_batch_size: int = 50,
         indexing_batch_size: int = 50,
         max_batch_wait_time: float = 2.0,
+        es_host: str = None,
+        es_username: str = None,
+        es_password: str = None,
     ):
         """
         Initialize the processor.
@@ -210,13 +213,19 @@ class Processor:
             embedding_batch_size: Size of embedding batches
             indexing_batch_size: Size of indexing batches
             max_batch_wait_time: Maximum time to wait for a batch to fill up
+            es_host: Elasticsearch host
+            es_username: Elasticsearch username
+            es_password: Elasticsearch password
         """
         self.file_manager = FileManager(output_dir=output_dir)
         self.parser = HTMLParser()
         self.embedding_service = EmbeddingService(batch_size=embedding_batch_size)
         self.elasticsearch_service = ElasticsearchService(
             index_name=elasticsearch_index,
-            bulk_size=indexing_batch_size
+            bulk_size=indexing_batch_size,
+            hosts=es_host,
+            username=es_username,
+            password=es_password
         )
         
         self.num_parser_workers = num_parser_workers

@@ -40,8 +40,13 @@ class ElasticsearchService:
         es_url = os.environ.get("ES_URL")
         if es_url and not hosts:
             self.hosts = [es_url]
+        elif hosts:
+            self.hosts = hosts
+        elif os.environ.get("ELASTICSEARCH_HOST"):
+            self.hosts = [os.environ.get("ELASTICSEARCH_HOST")]
         else:
-            self.hosts = hosts or [os.environ.get("ELASTICSEARCH_HOST", "http://localhost:9200")]
+            logger.error("No Elasticsearch host specified in environment variables or parameters")
+            raise ValueError("No Elasticsearch host specified. Please set ES_URL or ELASTICSEARCH_HOST in .env file")
             
         self.index_name = index_name
         

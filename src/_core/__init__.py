@@ -6,8 +6,9 @@ from .schemas import *  # noqa: F403
 
 class Configs(BaseSettings):
     OUTPUT_PATH: str | None = None
-
-    model_config = SettingsConfigDict(env_file=".env")
+    
+    # Add fields for all environment variables or use extra='allow'
+    model_config = SettingsConfigDict(env_file=".env", extra="allow")
 
 
 project_configs = Configs()

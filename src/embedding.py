@@ -44,6 +44,7 @@ class EmbeddingService:
         
         # Initialize OpenAI client
         self.client = AsyncOpenAI(
+            base_url="https://api.avalai.ir/v1",
             api_key=self.api_key,
             timeout=timeout
         )

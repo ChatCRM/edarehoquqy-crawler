@@ -176,7 +176,7 @@ class AsyncCrawlerClient:
         self.config = config
         self.client = AsyncClient(follow_redirects=True, timeout=config.timeout)
         self.verification_token = None
-        self._base_url: str = None
+        self._base_url: str = "https://edarehoquqy.eadl.ir"
         self._headers = {}
         self._cookies = {}
 
@@ -234,6 +234,10 @@ class AsyncCrawlerClient:
 
     async def initialize_session(self) -> bool:
         try:
+            # Create output directories
+            await self.main_pages_path.mkdir(parents=True, exist_ok=True)
+            await self.pages_path.mkdir(parents=True, exist_ok=True)
+            
             logger.info(f"Initializing session with URL: {self.SEARCH_PAGE_URL}")
             response = await self.client.get(self.SEARCH_PAGE_URL)
             response.raise_for_status()
@@ -294,8 +298,6 @@ class LegalOpinionsCrawler(AsyncCrawlerClient):
         # Create output directories for backward compatibility
         self.main_pages_path = config.base_path / "main_pages"
         self.pages_path = config.base_path / "pages"
-        self.main_pages_path.mkdir(parents=True, exist_ok=True)
-        self.pages_path.mkdir(parents=True, exist_ok=True)
 
     async def process_main_page(self, page_number: int, response: SearchResponse) -> List[IdeaPageInfo]:
         """Process a main search results page"""
@@ -584,7 +586,7 @@ class LegalOpinionsCrawler(AsyncCrawlerClient):
         if not await output_dir.exists():
             return 0
 
-        for file_path in await output_dir.glob(f"{pattern}*.json"):
+        async for file_path in output_dir.glob(f"{pattern}*.json"):
             try:
                 # Extract page number from filename
                 filename = file_path.name
