@@ -284,47 +284,25 @@ class ElasticsearchService:
         Returns:
             bool: True if all documents were indexed successfully, False otherwise
         """
-        if not documents:
-            return True
+        # Prepare all documents at once
+        for doc_id, content, embedding in documents:
+            document = {
+                "question": content.question,
+                "answer": content.answer,
+                "content": content.content,
+                "id_ghavanin": doc_id,
+                "metadata": content.metadata.model_dump(),
+                "embedding": embedding
+            }
             
-        # Process documents in smaller chunks to avoid timeouts
-        chunk_size = min(self.bulk_size, 20)  # Use smaller chunks for better reliability
-        chunks = [documents[i:i + chunk_size] for i in range(0, len(documents), chunk_size)]
+            self.bulk_buffer.append({
+                "_index": self.index_name,
+                "_id": doc_id,
+                "_source": document
+            })
         
-        logger.info(f"Processing {len(documents)} documents in {len(chunks)} chunks of up to {chunk_size} documents each")
-        
-        all_success = True
-        for i, chunk in enumerate(chunks):
-            # Prepare all documents in the chunk
-            for doc_id, content, embedding in chunk:
-                document = {
-                    "question": content.question,
-                    "answer": content.answer,
-                    "content": content.content,
-                    "id_edarehoquqy": doc_id,
-                    "metadata": content.metadata.model_dump(),
-                    "embedding": embedding
-                }
-                
-                self.bulk_buffer.append({
-                    "_index": self.index_name,
-                    "_id": doc_id,
-                    "_source": document
-                })
-            
-            # Flush the buffer for this chunk
-            chunk_success = await self._flush_bulk_buffer()
-            if not chunk_success:
-                all_success = False
-                logger.error(f"Failed to index chunk {i+1}/{len(chunks)}")
-            else:
-                logger.info(f"Successfully indexed chunk {i+1}/{len(chunks)}")
-            
-            # Add a small delay between chunks to avoid overwhelming the server
-            if i < len(chunks) - 1:  # Don't sleep after the last chunk
-                await asyncio.sleep(1)
-        
-        return all_success
+        # Flush the buffer
+        return await self.flush_all()
     
     async def search_by_vector(self, embedding: List[float], k: int = 5) -> List[Dict[str, Any]]:
         """
@@ -358,36 +336,172 @@ class ElasticsearchService:
             logger.error(f"Error in vector search: {str(e)}")
             return []
     
-    async def search_by_text(self, query_text: str, size: int = 10) -> List[Dict[str, Any]]:
+    async def search_by_text(self, query_text: str, max_results: int = None) -> List[Dict[str, Any]]:
         """
-        Search for documents by text.
+        Search for documents by text using scroll API for reliable retrieval of all matches.
         
         Args:
             query_text: Text to search for
-            size: Number of results to return
+            max_results: Maximum number of results to return. If None, returns all matching documents.
             
         Returns:
-            List[Dict[str, Any]]: List of search results
+            List[Dict[str, Any]]: List of search results with no duplicates
         """
         query = {
             "query": {
-                "multi_match": {
-                    "query": query_text,
-                    "fields": ["question^2", "answer", "content"],
-                    "type": "best_fields",
-                    "analyzer": "persian"
+                "bool": {
+                    "should": [
+                        # Exact phrase matches (highest priority)
+                        {
+                            "multi_match": {
+                                "query": query_text,
+                                "fields": ["question^4", "answer^3", "content^2"],
+                                "type": "phrase",
+                                "analyzer": "persian",
+                                "boost": 3
+                            }
+                        },
+                        # Term proximity search
+                        {
+                            "multi_match": {
+                                "query": query_text,
+                                "fields": ["question^3", "answer^2", "content"],
+                                "type": "phrase_prefix",
+                                "analyzer": "persian",
+                                "boost": 2
+                            }
+                        },
+                        # Fuzzy matching for typos and variations
+                        {
+                            "multi_match": {
+                                "query": query_text,
+                                "fields": ["question^2", "answer^1.5", "content"],
+                                "type": "best_fields",
+                                "analyzer": "persian",
+                                "fuzziness": "AUTO",
+                                "boost": 1
+                            }
+                        }
+                    ],
+                    "minimum_should_match": 1,
+                    # Filter to ensure some minimum relevance
+                    "filter": [
+                        {
+                            "multi_match": {
+                                "query": query_text,
+                                "fields": ["question", "answer", "content"],
+                                "operator": "and",
+                                "minimum_should_match": "70%"
+                            }
+                        }
+                    ]
                 }
             },
-            "size": size
+            "_source": ["question", "answer", "content", "metadata", "id_ghavanin", "id_edarehoquqy"],
+            # Use collapse to deduplicate results by _id field
+            "collapse": {
+                "field": "_id"
+            },
+            # Track total hits for accurate count
+            "track_total_hits": True,
+            # Optimized batch size for scrolling
+            "size": 1000,
+            # Sort for consistent results (necessary for scroll)
+            "sort": ["_score", {"_id": "asc"}]
         }
         
         try:
-            response = await self.client.search(
+            # First, get the total number of matching documents
+            initial_response = await self.client.search(
                 index=self.index_name,
-                body=query
+                body={
+                    "query": query["query"],
+                    "collapse": query["collapse"],
+                    "track_total_hits": True,
+                    "size": 0  # Just get the count, no actual documents
+                }
             )
             
-            return [hit["_source"] for hit in response["hits"]["hits"]]
+            total_hits = initial_response["hits"]["total"]["value"]
+            logger.info(f"Total matching documents after deduplication: {total_hits}")
+            
+            # Set max_results to total if not specified
+            if max_results is None:
+                max_results = total_hits
+            else:
+                max_results = min(max_results, total_hits)
+            
+            # If no results, return empty list
+            if total_hits == 0:
+                return []
+                
+            all_results = []
+            
+            # Initialize scroll
+            scroll_time = "10m"  # Keep scroll context alive for 10 minutes
+            response = await self.client.search(
+                index=self.index_name,
+                body=query,
+                scroll=scroll_time
+            )
+            
+            scroll_id = response.get("_scroll_id")
+            
+            # Process first batch of results
+            hits = response["hits"]["hits"]
+            for hit in hits:
+                source = hit["_source"]
+                source["_score"] = hit["_score"]
+                all_results.append(source)
+                
+                # Stop if we've reached max_results
+                if len(all_results) >= max_results:
+                    break
+            
+            # Continue scrolling if we need more results
+            while scroll_id and len(all_results) < max_results:
+                try:
+                    scroll_response = await self.client.scroll(
+                        scroll_id=scroll_id,
+                        scroll=scroll_time
+                    )
+                    
+                    # Break if no more hits
+                    hits = scroll_response["hits"]["hits"]
+                    if not hits:
+                        break
+                    
+                    # Process batch
+                    for hit in hits:
+                        source = hit["_source"]
+                        source["_score"] = hit["_score"]
+                        all_results.append(source)
+                        
+                        # Stop if we've reached max_results
+                        if len(all_results) >= max_results:
+                            break
+                    
+                    # Update scroll_id for next batch
+                    scroll_id = scroll_response.get("_scroll_id")
+                    
+                    # Log progress for large result sets
+                    if len(all_results) % 5000 == 0:
+                        logger.info(f"Retrieved {len(all_results)} of {max_results} results")
+                        
+                except Exception as scroll_error:
+                    logger.error(f"Error during scroll: {str(scroll_error)}")
+                    break
+            
+            # Clean up scroll context
+            if scroll_id:
+                try:
+                    await self.client.clear_scroll(scroll_id=scroll_id)
+                except Exception as e:
+                    logger.warning(f"Error clearing scroll: {str(e)}")
+            
+            logger.info(f"Retrieved {len(all_results)} total results using scroll API")
+            return all_results
+            
         except Exception as e:
             logger.error(f"Error in text search: {str(e)}")
             return []
@@ -395,3 +509,12 @@ class ElasticsearchService:
     async def close(self):
         """Close the Elasticsearch client connection."""
         await self.client.close() 
+
+    
+    async def __aenter__(self):
+        await self.ensure_index_exists()
+        return self
+    
+    async def __aexit__(self, exc_type, exc_value, traceback):
+        await self.close()
+        self.client = None
