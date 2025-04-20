@@ -4,8 +4,10 @@ import logging
 import aiofiles
 import asyncio
 import os
+from typing import List
 from pathlib import Path
 from dotenv import load_dotenv
+from pydantic import BaseModel
 
 from src.elasticsearch_service import ElasticsearchService
 
@@ -15,6 +17,54 @@ total_ids = set()
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+# "_source": ["question", "answer", "content", "metadata", "id_ghavanin", "id_edarehoquqy"],
+"""
+        "metadata": {
+          "properties": {
+            "file_id": {
+              "type": "keyword"
+            },
+            "file_number": {
+              "type": "keyword",
+              "null_value": "نامشخص"
+            },
+            "opinion_date": {
+              "properties": {
+                "gregorian": {
+                  "type": "date",
+                  "format": "yyyy/MM/dd",
+                  "null_value": "0001/01/01"
+                },
+                "shamsi": {
+                  "type": "keyword",
+                  "null_value": "0001/01/01"
+                }
+              }
+            },
+            "opinion_number": {
+              "type": "keyword",
+              "null_value": "نامشخص"
+            }
+          }
+        },
+"""
+class Metadata(BaseModel):
+    file_id: str
+    file_number: str
+    opinion_date: dict
+    opinion_number: str
+
+class EdarehoquqyDataModel(BaseModel):
+    id_edarehoquqy: str
+    question: str
+    answer: str
+    content: str
+    metadata: dict
+    
+    @property
+    def metadata_obj(self):
+        return Metadata(**self.metadata)
+
 
 async def get_csv_data(es: ElasticsearchService, index_name: str, query: dict) -> pd.DataFrame:
     """
@@ -98,6 +148,25 @@ async def save_file(file_path: Path, content: str):
     except Exception as e:
         logger.error(f"Error saving file: {e}")
         raise
+
+async def save_obj_to_file(path: Path, obj: EdarehoquqyDataModel) -> None:
+    """
+    Save an object to a file asynchronously.
+    """
+    try:
+        ...
+    except Exception as e:
+        logger.error(f"Error saving object to file: {e}")
+        raise
+
+async def save_batch_content(path: Path, content_list: List[EdarehoquqyDataModel]) -> None:
+    """
+    Save a list of content to files asynchronously.
+    """
+    path.mkdir(parents=True, exist_ok=True)
+    for content in content_list:
+        await save_obj_to_file(path / f"{content.metadata_obj.file_id}.md", content)
+    return None
 
 async def main():
     # Initialize the Elasticsearch client
