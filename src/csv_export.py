@@ -3,13 +3,10 @@ import logging
 import aiofiles
 import asyncio
 import os
-import json
-import io
-import csv
+from typing import List
 from pathlib import Path
 from dotenv import load_dotenv
-from openai import AsyncOpenAI
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 from src.elasticsearch_service import ElasticsearchService
 
@@ -20,20 +17,8 @@ total_ids = set()
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
+# "_source": ["question", "answer", "content", "metadata", "id_ghavanin", "id_edarehoquqy"],
 """
-        "id_edarehoquqy": {
-          "type": "keyword"
-        },
-        "id_ghavanin": {
-          "type": "text",
-          "fields": {
-            "keyword": {
-              "type": "keyword",
-              "ignore_above": 256
-            }
-          }
-        },
         "metadata": {
           "properties": {
             "file_id": {
@@ -69,35 +54,22 @@ class Metadata(BaseModel):
     opinion_date: dict
     opinion_number: str
 
-    @property
-    def opinion_date(self) -> str:
-        return self.opinion_date['shamsi']
-    
-    @property
-    def opinion_date_gregorian(self) -> str:
-        return self.opinion_date['gregorian']
-    
-    
-
-class EdarehoquqyDocument(BaseModel):
-    id_edarehoquqy: str 
+class EdarehoquqyDataModel(BaseModel):
+    id_edarehoquqy: str
     question: str
     answer: str
-    summary: str = Field(default="")
-    title: str = Field(default="")
-    metdata: dict
-
+    content: str
+    metadata: dict
+    
     @property
-    def metadata(self) -> Metadata:
-        return Metadata(**self.metdata)
-    
+    def metadata_obj(self):
+        return Metadata(**self.metadata)
 
 
-
-async def get_doc_title(client: AsyncOpenAI, doc: str) -> dict:
+async def get_csv_data(es: ElasticsearchService, index_name: str, query: dict) -> pd.DataFrame:
     """
-    Generate a concise, descriptive title (5-6 words) for a legal document in Persian.
-    
+    Get data from Elasticsearch and return a pandas DataFrame.
+
     Args:
         client: AsyncOpenAI client instance
         doc: The document text to generate a title for
@@ -245,7 +217,59 @@ async def save_file(file_path: Path, content):
         logger.error(f"Error saving file: {e}")
         raise
 
+async def save_obj_to_file(path: Path, obj: EdarehoquqyDataModel) -> None:
+    """
+    Save an object to a file asynchronously.
+    """
+    try:
+        ...
+    except Exception as e:
+        logger.error(f"Error saving object to file: {e}")
+        raise
+
+async def save_batch_content(path: Path, content_list: List[EdarehoquqyDataModel]) -> None:
+    """
+    Save a list of content to files asynchronously.
+    """
+    path.mkdir(parents=True, exist_ok=True)
+    for content in content_list:
+        await save_obj_to_file(path / f"{content.metadata_obj.file_id}.md", content)
+    return None
+
 async def main():
+    # Initialize the Elasticsearch client
+    """
+    keyword list:
+    ۱) تصرف عدوانی
+    ۲)خلع ید
+    ۳) ممانعت از حق
+    ۴)مزاحمت
+    ۵)حق کسب و پیشه
+    ۶) سرقفلی
+    ۷) تقسیم مال مشاعی
+    ۸) افراز 
+    ۹) فروش سهام 
+    ۱۰) ابطال سند
+    ۱۱) بطلان معامله 
+    ۱۲) اثبات مالکیت 
+    ۱۳) تعارض ثبتی
+    ۱۴) سرقت 
+    ۱۵)کلاهبرداری
+    ۱۶) اخذ به شفعه 
+    ۱۷) اشتباه در معامله
+    ۱۸)صحت قرارداد
+    ۱۹) الزام به تنظیم سند رسمی 
+    ۲۰) تحویل مبیع
+    ۲۱) مطالبه وجه چک 
+    ۲۲) استرداد لاشه چک
+    ۲۳)خیانت در امانت
+    ۲۴) اختلاس
+    ۲۵) پولشویی 
+    ۲۶) انحلال شرکت
+    ۲۷) ایفای تعهدات 
+    ۲۸) تغییر کاربری اراضی زراعی
+    ۲۹) اراضی ملی
+    """
     keywords = [
         #"تصرف عدوانی",
         "سرقت",
