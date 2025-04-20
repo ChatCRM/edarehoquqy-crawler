@@ -38,14 +38,14 @@ class ElasticsearchService:
             max_retries: Maximum number of retries for failed requests
         """
         # Check for ES_URL first, then fall back to ELASTICSEARCH_HOST
-        self.hosts = hosts or [os.getenv("ELASTIC_SEARCH_HOST")]
+        self.hosts = hosts or [os.getenv("ELASTICSEARCH_HOST")]
             
         self.index_name = index_name
         
         # Check for ES_PASSWORD first, then fall back to ELASTICSEARCH_PASSWORD
-        self.password = password or os.environ.get("ELASTIC_SEARCH_PASSWORD")
+        self.password = password or os.environ.get("ELASTICSEARCH_PASSWORD")
             
-        self.username = username or os.environ.get("ELASTIC_SEARCH_USERNAME", "elastic")
+        self.username = username or os.environ.get("ELASTICSEARCH_USERNAME", "elastic")
         
         self.timeout = timeout
         self.bulk_size = bulk_size
@@ -338,7 +338,7 @@ class ElasticsearchService:
     
     async def search_by_text(self, query_text: str, max_results: int = None) -> List[Dict[str, Any]]:
         """
-        Search for documents by text using scroll API for reliable retrieval of all matches.
+        Search for documents by text using pagination for reliable retrieval of matches.
         
         Args:
             query_text: Text to search for
@@ -398,16 +398,12 @@ class ElasticsearchService:
                 }
             },
             "_source": ["question", "answer", "content", "metadata", "id_ghavanin", "id_edarehoquqy"],
-            # Use collapse to deduplicate results by _id field
-            "collapse": {
-                "field": "_id"
-            },
             # Track total hits for accurate count
             "track_total_hits": True,
-            # Optimized batch size for scrolling
+            # Use a larger page size for efficiency
             "size": 1000,
-            # Sort for consistent results (necessary for scroll)
-            "sort": ["_score", {"_id": "asc"}]
+            # Sort for consistent results
+            "sort": ["_score", {"id_edarehoquqy": "asc"}]
         }
         
         try:
@@ -416,90 +412,76 @@ class ElasticsearchService:
                 index=self.index_name,
                 body={
                     "query": query["query"],
-                    "collapse": query["collapse"],
                     "track_total_hits": True,
                     "size": 0  # Just get the count, no actual documents
                 }
             )
             
             total_hits = initial_response["hits"]["total"]["value"]
-            logger.info(f"Total matching documents after deduplication: {total_hits}")
-            
-            # Set max_results to total if not specified
-            if max_results is None:
-                max_results = total_hits
-            else:
-                max_results = min(max_results, total_hits)
+            logger.info(f"Total matching documents: {total_hits}")
             
             # If no results, return empty list
             if total_hits == 0:
                 return []
                 
             all_results = []
+            seen_ids = set()  # Track seen document IDs for deduplication
+            from_position = 0
+            page_size = 1000
             
-            # Initialize scroll
-            scroll_time = "10m"  # Keep scroll context alive for 10 minutes
-            response = await self.client.search(
-                index=self.index_name,
-                body=query,
-                scroll=scroll_time
-            )
-            
-            scroll_id = response.get("_scroll_id")
-            
-            # Process first batch of results
-            hits = response["hits"]["hits"]
-            for hit in hits:
-                source = hit["_source"]
-                source["_score"] = hit["_score"]
-                all_results.append(source)
+            # Use pagination instead of scroll
+            while len(all_results) < total_hits:
+                if max_results is not None and len(all_results) >= max_results:
+                    break
+                    
+                # Update from position in the query
+                search_query = query.copy()
+                search_query["from"] = from_position
+                search_query["size"] = page_size
                 
-                # Stop if we've reached max_results
-                if len(all_results) >= max_results:
+                response = await self.client.search(
+                    index=self.index_name,
+                    body=search_query
+                )
+                
+                # Break if no more hits
+                hits = response["hits"]["hits"]
+                if not hits:
                     break
-            
-            # Continue scrolling if we need more results
-            while scroll_id and len(all_results) < max_results:
-                try:
-                    scroll_response = await self.client.scroll(
-                        scroll_id=scroll_id,
-                        scroll=scroll_time
-                    )
+                
+                # Process batch with deduplication
+                for hit in hits:
+                    doc_id = None
+                    source = hit["_source"]
                     
-                    # Break if no more hits
-                    hits = scroll_response["hits"]["hits"]
-                    if not hits:
+                    # Try to get a unique ID
+                    if "id_edarehoquqy" in source:
+                        doc_id = source["id_edarehoquqy"]
+                    elif "id_ghavanin" in source:
+                        doc_id = source["id_ghavanin"]
+                    else:
+                        doc_id = hit["_id"]
+                        
+                    # Skip if we've seen this ID before
+                    if doc_id in seen_ids:
+                        continue
+                        
+                    seen_ids.add(doc_id)
+                    source["_score"] = hit["_score"]
+                    all_results.append(source)
+                    
+                    # Stop if we've reached max_results
+                    if max_results is not None and len(all_results) >= max_results:
                         break
-                    
-                    # Process batch
-                    for hit in hits:
-                        source = hit["_source"]
-                        source["_score"] = hit["_score"]
-                        all_results.append(source)
-                        
-                        # Stop if we've reached max_results
-                        if len(all_results) >= max_results:
-                            break
-                    
-                    # Update scroll_id for next batch
-                    scroll_id = scroll_response.get("_scroll_id")
-                    
-                    # Log progress for large result sets
-                    if len(all_results) % 5000 == 0:
-                        logger.info(f"Retrieved {len(all_results)} of {max_results} results")
-                        
-                except Exception as scroll_error:
-                    logger.error(f"Error during scroll: {str(scroll_error)}")
-                    break
+                
+                # Move to next page
+                from_position += page_size
+                
+                # Log progress for large result sets
+                if len(all_results) % 5000 == 0:
+                    logger.info(f"Retrieved {len(all_results)} results so far")
             
-            # Clean up scroll context
-            if scroll_id:
-                try:
-                    await self.client.clear_scroll(scroll_id=scroll_id)
-                except Exception as e:
-                    logger.warning(f"Error clearing scroll: {str(e)}")
-            
-            logger.info(f"Retrieved {len(all_results)} total results using scroll API")
+            logger.info(f"Retrieved {len(all_results)} total deduplicated results")
             return all_results
             
         except Exception as e:
