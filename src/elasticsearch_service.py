@@ -1,3 +1,4 @@
+import traceback
 import os
 import logging
 import asyncio
@@ -51,7 +52,6 @@ class ElasticsearchService:
         self.bulk_size = bulk_size
         self.retry_on_timeout = retry_on_timeout
         self.max_retries = max_retries
-        self.__keyword_query = None
         
         # Initialize the client
         self.client = AsyncElasticsearch(
@@ -64,69 +64,130 @@ class ElasticsearchService:
         )
         
         # Bulk operation buffer
-        self.bulk_buffer = []
-    
-    @property
-    def keyword_query(self, query_text: str) -> str:
-        if self.__keyword_query is None:
-            self.__keyword_query = {
-                "query": {
-                    "bool": {
-                        "should": [
-                            # Exact phrase matches (highest priority)
-                            {
-                                "multi_match": {
-                                    "query": query_text,
-                                    "fields": ["question^4", "answer^3", "content^2"],
-                                    "type": "phrase",
-                                    "analyzer": "persian",
-                                    "boost": 3
+        self.bulk_buffer = [] 
+        
+    def get_keyword_query(self, query_text: str) -> dict:
+        # Precision-focused query with relevance prioritization
+        return {
+            "query": {
+                "function_score": {
+                    "query": {
+                        "bool": {
+                            "should": [
+                                # Exact phrase matches (highest priority)
+                                {
+                                    "multi_match": {
+                                        "query": query_text,
+                                        "fields": ["question^5", "answer^4", "content^2"],
+                                        "type": "phrase",
+                                        "analyzer": "persian",
+                                        "boost": 5
+                                    }
+                                },
+                                # Close phrase matches with limited slop
+                                {
+                                    "multi_match": {
+                                        "query": query_text,
+                                        "fields": ["question^4", "answer^3", "content^1.5"],
+                                        "type": "phrase",
+                                        "slop": 3,  # Reduced slop for higher precision
+                                        "analyzer": "persian",
+                                        "boost": 3
+                                    }
+                                },
+                                # Controlled term matching (balanced approach)
+                                {
+                                    "multi_match": {
+                                        "query": query_text,
+                                        "fields": ["question^3", "answer^2.5", "content^1"],
+                                        "type": "best_fields",
+                                        "operator": "and",  # Changed to AND for higher precision
+                                        "minimum_should_match": "70%",  # Require most terms to match
+                                        "analyzer": "persian",
+                                        "boost": 2.5
+                                    }
+                                },
+                                # Term proximity with limited prefix matching
+                                {
+                                    "multi_match": {
+                                        "query": query_text,
+                                        "fields": ["question^3", "answer^2.5", "content^1"],
+                                        "type": "phrase_prefix",
+                                        "analyzer": "persian",
+                                        "max_expansions": 20,  # Limited expansions for precision
+                                        "boost": 2
+                                    }
+                                },
+                                # More controlled fuzzy matching
+                                {
+                                    "multi_match": {
+                                        "query": query_text,
+                                        "fields": ["question^2", "answer^1.5", "content"],
+                                        "type": "best_fields",
+                                        "analyzer": "persian",
+                                        "fuzziness": 1,  # Stricter fuzziness
+                                        "prefix_length": 3,  # First 3 chars must match exactly
+                                        "boost": 1
+                                    }
+                                },
+                                # Cross-field matching with higher threshold
+                                {
+                                    "multi_match": {
+                                        "query": query_text,
+                                        "fields": ["question", "answer", "content"],
+                                        "type": "cross_fields",
+                                        "analyzer": "persian",
+                                        "operator": "and",  # Changed to AND
+                                        "minimum_should_match": "70%",  # Higher threshold
+                                        "boost": 1.5
+                                    }
                                 }
-                            },
-                            # Term proximity search
-                            {
-                                "multi_match": {
-                                    "query": query_text,
-                                    "fields": ["question^3", "answer^2", "content"],
-                                    "type": "phrase_prefix",
-                                    "analyzer": "persian",
-                                    "boost": 2
+                            ],
+                            "minimum_should_match": 1,
+                            # Precision filter that ensures good relevance
+                            "filter": [
+                                {
+                                    "multi_match": {
+                                        "query": query_text,
+                                        "fields": ["question", "answer", "content"],
+                                        "operator": "and",  # Changed to AND for higher precision
+                                        "minimum_should_match": "65%"  # Balanced threshold for relevance
+                                    }
                                 }
-                            },
-                            # Fuzzy matching for typos and variations
-                            {
-                                "multi_match": {
-                                    "query": query_text,
-                                    "fields": ["question^2", "answer^1.5", "content"],
-                                    "type": "best_fields",
-                                    "analyzer": "persian",
-                                    "fuzziness": "AUTO",
-                                    "boost": 1
-                                }
+                            ]
+                        }
+                    },
+                    # Boost by original score for natural ordering
+                    "functions": [
+                        {
+                            "field_value_factor": {
+                                "field": "_score",
+                                "factor": 1.2,
+                                "modifier": "ln2p",
+                                "missing": 1
                             }
-                        ],
-                        "minimum_should_match": 1,
-                        # Filter to ensure some minimum relevance
-                        "filter": [
-                            {
-                                "multi_match": {
-                                    "query": query_text,
-                                    "fields": ["question", "answer", "content"],
-                                    "operator": "and",
-                                    "minimum_should_match": "70%"
-                                }
-                            }
-                        ]
-                    }
+                        }
+                    ],
+                    "score_mode": "sum",
+                    "boost_mode": "multiply"
+                }
+            },
+            "_source": ["question", "answer", "content", "metadata", "id_ghavanin", "id_edarehoquqy"],
+            "track_total_hits": True,
+            "size": 1000,
+            "sort": [
+                "_score", 
+                {"id_edarehoquqy": "asc"}
+            ],
+            "highlight": {
+                "fields": {
+                    "question": {"number_of_fragments": 2, "fragment_size": 150},
+                    "answer": {"number_of_fragments": 2, "fragment_size": 150},
+                    "content": {"number_of_fragments": 2, "fragment_size": 150}
                 },
-                "_source": ["question", "answer", "content", "metadata", "id_ghavanin", "id_edarehoquqy"],
-                # Track total hits for accurate count
-                "track_total_hits": True,
-                # Use a larger page size for efficiency
-                "size": 1000,
-                "sort": ["_score", {"id_edarehoquqy": "asc"}]
+                "order": "score"
             }
-        return self.__keyword_query
+        }
         
     async def ensure_index_exists(self) -> None:
         """Ensure the index exists with the correct mappings."""
@@ -204,21 +265,51 @@ class ElasticsearchService:
             }
         }
         
-        # Check if index exists
-        try:
-            exists = await self.client.indices.exists(index=self.index_name)
-            if not exists:
-                # Create index with mapping
-                await self.client.indices.create(
-                    index=self.index_name,
-                    body=mapping
-                )
-                logger.info(f"Created index {self.index_name}")
-            else:
-                logger.info(f"Index {self.index_name} already exists")
-        except Exception as e:
-            logger.error(f"Error checking/creating index: {str(e)}")
-            raise
+        # Check if index exists with retry logic
+        retry_delay = 2
+        max_attempts = 3
+        for attempt in range(max_attempts):
+            try:
+                # Log connection attempt with host information
+                hosts_str = ', '.join(self.hosts) if isinstance(self.hosts, list) else str(self.hosts)
+                logger.info(f"Attempting to connect to Elasticsearch at {hosts_str} (attempt {attempt+1}/{max_attempts})")
+                
+                # First check if we can connect to Elasticsearch at all
+                info = await self.client.info(request_timeout=10)
+                logger.info(f"Successfully connected to Elasticsearch version {info.get('version', {}).get('number', 'unknown')}")
+                
+                # Now check if the index exists
+                exists = await self.client.indices.exists(index=self.index_name, request_timeout=10)
+                if not exists:
+                    # Create index with mapping
+                    logger.info(f"Creating index {self.index_name}...")
+                    await self.client.indices.create(
+                        index=self.index_name,
+                        body=mapping,
+                        request_timeout=30
+                    )
+                    logger.info(f"Created index {self.index_name}")
+                    return
+                else:
+                    logger.info(f"Index {self.index_name} already exists")
+                    return
+                    
+            except Exception as e:
+                if attempt < max_attempts - 1:
+                    # Log detailed exception info
+                    logger.warning(f"Attempt {attempt+1}/{max_attempts} to connect to Elasticsearch failed: {str(e)}")
+                    logger.warning(f"Exception type: {type(e).__name__}")
+                    logger.warning(f"Exception details: {repr(e)}")
+                    
+                    wait_time = retry_delay * (2 ** attempt)  # Exponential backoff
+                    logger.warning(f"Retrying in {wait_time} seconds...")
+                    await asyncio.sleep(wait_time)
+                else:
+                    logger.error(f"Error checking/creating index after {max_attempts} attempts: {str(e)}")
+                    logger.error(f"Exception type: {type(e).__name__}")
+                    logger.error(f"Exception details: {repr(e)}")
+                    # Don't raise the exception, just continue with partial functionality
+                    return
     
     async def index_document(self, document_id: str, content: ParsedContent, embedding: List[float]) -> bool:
         """
@@ -401,94 +492,105 @@ class ElasticsearchService:
     
     async def search_by_text_batch(self, query_text: str, max_results: int = None) -> List[Dict[str, Any]]:
         """
-        Search for documents by text using pagination for reliable retrieval of matches.
+        Search for documents by text using the Elasticsearch scroll API to reliably retrieve matches in batches.
         
         Args:
             query_text: Text to search for
             max_results: Maximum number of results to return. If None, returns all matching documents.
             
         Returns:
-            List[Dict[str, Any]]: List of search results with no duplicates
+            async generator yielding batches of search results with no duplicates
         """
-        
         try:
-            # First, get the total number of matching documents
-            search_query = self.keyword_query(query_text)
-            initial_response = await self.client.search(
+            # Use our search query with a fixed batch size
+            search_query = self.get_keyword_query(query_text)
+            search_query["size"] = 100  # Fixed batch size
+            search_query["track_total_hits"] = True  # Ensure we get the total hit count
+            
+            logger.info(f"Starting scroll search with query: {query_text}")
+            
+            # Initialize scroll search
+            scroll_response = await self.client.search(
                 index=self.index_name,
-                body={
-                    "query": search_query["query"],
-                    "track_total_hits": True,
-                    "size": 0  # Just get the count, no actual documents
-                }
+                body=search_query,
+                scroll="2m"  # Keep scroll context alive for 2 minutes
             )
             
-            total_hits = initial_response["hits"]["total"]["value"]
-            logger.info(f"Total matching documents: {total_hits}")
+            scroll_id = scroll_response["_scroll_id"]
+            total_docs = scroll_response["hits"]["total"]["value"]
+            logger.info(f"Total matching documents available: {total_docs}")
             
-            # If no results, return empty list
-            if total_hits == 0:
-                return
-                
-            result_num = 0
+            # Process results in batches
+            processed_count = 0
             seen_ids = set()  # Track seen document IDs for deduplication
-            from_position = 0
-            page_size = 1000
             
-            # Use pagination instead of scroll
-            while result_num < total_hits:
-                if max_results is not None and result_num >= max_results:
-                    break
-                    
-                # Update from position in the query
-                search_query = self.keyword_query(query_text)
-                search_query["from"] = from_position
-                search_query["size"] = page_size
-                
-                response = await self.client.search(
-                    index=self.index_name,
-                    body=search_query
-                )
-                
-                # Break if no more hits
-                hits = response["hits"]["hits"]
+            while True:
+                hits = scroll_response["hits"]["hits"]
                 if not hits:
+                    logger.info(f"No more results to process, reached end of scroll")
                     break
                 
-                # Process batch with deduplication
+                # Process current batch
+                batch_results = []
+                
                 for hit in hits:
-                    doc_id = None
-                    source = hit["_source"]
+                    # Break if we've reached max_results
+                    if max_results is not None and processed_count >= max_results:
+                        logger.info(f"Reached max_results limit of {max_results}")
+                        break
                     
-                    # Try to get a unique ID
-                    if "id_edarehoquqy" in source:
-                        doc_id = source["id_edarehoquqy"]
-                    elif "id_ghavanin" in source:
-                        doc_id = source["id_ghavanin"]
-                    else:
-                        doc_id = hit["_id"]
-                        
+                    source = hit["_source"]
+                    doc_id = source.get("id_edarehoquqy") or source.get("id_ghavanin") or hit["_id"]
+                    
                     # Skip if we've seen this ID before
                     if doc_id in seen_ids:
                         continue
-                        
+                    
                     seen_ids.add(doc_id)
-                    source["_score"] = hit["_score"]
-                    yield source
+                    source["_score"] = hit.get("_score")
+                    batch_results.append(source)
+                    processed_count += 1
                 
-                # Move to next page
-                from_position += page_size
-                result_num += len(hits)
-                # Log progress for large result sets
-                if result_num % 5000 == 0:
-                    logger.info(f"Retrieved {result_num} results so far")
+                # Log batch progress
+                logger.info(f"Processed batch with {len(batch_results)} documents, total so far: {processed_count}/{total_docs}")
+                
+                # Yield the current batch if there are results
+                if batch_results:
+                    # Include total count with first batch
+                    if processed_count == len(batch_results):
+                        # Add total as metadata with the first batch
+                        yield {"total_count": total_docs, "results": batch_results}
+                    else:
+                        yield {"results": batch_results}
+                
+                # Break if we've processed all results or reached max_results
+                if not hits or (max_results is not None and processed_count >= max_results):
+                    break
+                
+                # Get the next batch
+                try:
+                    scroll_response = await self.client.scroll(
+                        scroll_id=scroll_id,
+                        scroll="2m"
+                    )
+                    scroll_id = scroll_response["_scroll_id"]
+                except Exception as e:
+                    logger.error(f"Error in scroll request: {str(e)}")
+                    break
             
-            logger.info(f"Retrieved {result_num} total deduplicated results")
+            logger.info(f"Search completed. Retrieved {processed_count} documents out of {total_docs} total matches")
+            
+            # Clean up scroll context
+            try:
+                if scroll_id:
+                    await self.client.clear_scroll(scroll_id=scroll_id)
+            except Exception as e:
+                logger.warning(f"Error clearing scroll context: {str(e)}")
             
         except Exception as e:
-            logger.error(f"Error in text search: {str(e)}")
+            logger.error(f"Error in scroll search: {str(e)}")
+            logger.error(f"Traceback: {traceback.format_exc()}")
             return
-        
     
     async def close(self):
         """Close the Elasticsearch client connection."""
