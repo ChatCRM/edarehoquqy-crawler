@@ -51,6 +51,7 @@ class ElasticsearchService:
         self.bulk_size = bulk_size
         self.retry_on_timeout = retry_on_timeout
         self.max_retries = max_retries
+        self.__keyword_query = None
         
         # Initialize the client
         self.client = AsyncElasticsearch(
@@ -65,6 +66,68 @@ class ElasticsearchService:
         # Bulk operation buffer
         self.bulk_buffer = []
     
+    @property
+    def keyword_query(self, query_text: str) -> str:
+        if self.__keyword_query is None:
+            self.__keyword_query = {
+                "query": {
+                    "bool": {
+                        "should": [
+                            # Exact phrase matches (highest priority)
+                            {
+                                "multi_match": {
+                                    "query": query_text,
+                                    "fields": ["question^4", "answer^3", "content^2"],
+                                    "type": "phrase",
+                                    "analyzer": "persian",
+                                    "boost": 3
+                                }
+                            },
+                            # Term proximity search
+                            {
+                                "multi_match": {
+                                    "query": query_text,
+                                    "fields": ["question^3", "answer^2", "content"],
+                                    "type": "phrase_prefix",
+                                    "analyzer": "persian",
+                                    "boost": 2
+                                }
+                            },
+                            # Fuzzy matching for typos and variations
+                            {
+                                "multi_match": {
+                                    "query": query_text,
+                                    "fields": ["question^2", "answer^1.5", "content"],
+                                    "type": "best_fields",
+                                    "analyzer": "persian",
+                                    "fuzziness": "AUTO",
+                                    "boost": 1
+                                }
+                            }
+                        ],
+                        "minimum_should_match": 1,
+                        # Filter to ensure some minimum relevance
+                        "filter": [
+                            {
+                                "multi_match": {
+                                    "query": query_text,
+                                    "fields": ["question", "answer", "content"],
+                                    "operator": "and",
+                                    "minimum_should_match": "70%"
+                                }
+                            }
+                        ]
+                    }
+                },
+                "_source": ["question", "answer", "content", "metadata", "id_ghavanin", "id_edarehoquqy"],
+                # Track total hits for accurate count
+                "track_total_hits": True,
+                # Use a larger page size for efficiency
+                "size": 1000,
+                "sort": ["_score", {"id_edarehoquqy": "asc"}]
+            }
+        return self.__keyword_query
+        
     async def ensure_index_exists(self) -> None:
         """Ensure the index exists with the correct mappings."""
         mapping = {
@@ -336,7 +399,7 @@ class ElasticsearchService:
             logger.error(f"Error in vector search: {str(e)}")
             return []
     
-    async def search_by_text(self, query_text: str, max_results: int = None) -> List[Dict[str, Any]]:
+    async def search_by_text_batch(self, query_text: str, max_results: int = None) -> List[Dict[str, Any]]:
         """
         Search for documents by text using pagination for reliable retrieval of matches.
         
@@ -347,71 +410,14 @@ class ElasticsearchService:
         Returns:
             List[Dict[str, Any]]: List of search results with no duplicates
         """
-        query = {
-            "query": {
-                "bool": {
-                    "should": [
-                        # Exact phrase matches (highest priority)
-                        {
-                            "multi_match": {
-                                "query": query_text,
-                                "fields": ["question^4", "answer^3", "content^2"],
-                                "type": "phrase",
-                                "analyzer": "persian",
-                                "boost": 3
-                            }
-                        },
-                        # Term proximity search
-                        {
-                            "multi_match": {
-                                "query": query_text,
-                                "fields": ["question^3", "answer^2", "content"],
-                                "type": "phrase_prefix",
-                                "analyzer": "persian",
-                                "boost": 2
-                            }
-                        },
-                        # Fuzzy matching for typos and variations
-                        {
-                            "multi_match": {
-                                "query": query_text,
-                                "fields": ["question^2", "answer^1.5", "content"],
-                                "type": "best_fields",
-                                "analyzer": "persian",
-                                "fuzziness": "AUTO",
-                                "boost": 1
-                            }
-                        }
-                    ],
-                    "minimum_should_match": 1,
-                    # Filter to ensure some minimum relevance
-                    "filter": [
-                        {
-                            "multi_match": {
-                                "query": query_text,
-                                "fields": ["question", "answer", "content"],
-                                "operator": "and",
-                                "minimum_should_match": "70%"
-                            }
-                        }
-                    ]
-                }
-            },
-            "_source": ["question", "answer", "content", "metadata", "id_ghavanin", "id_edarehoquqy"],
-            # Track total hits for accurate count
-            "track_total_hits": True,
-            # Use a larger page size for efficiency
-            "size": 1000,
-            # Sort for consistent results
-            "sort": ["_score", {"id_edarehoquqy": "asc"}]
-        }
         
         try:
             # First, get the total number of matching documents
+            search_query = self.keyword_query(query_text)
             initial_response = await self.client.search(
                 index=self.index_name,
                 body={
-                    "query": query["query"],
+                    "query": search_query["query"],
                     "track_total_hits": True,
                     "size": 0  # Just get the count, no actual documents
                 }
@@ -422,20 +428,20 @@ class ElasticsearchService:
             
             # If no results, return empty list
             if total_hits == 0:
-                return []
+                return
                 
-            all_results = []
+            result_num = 0
             seen_ids = set()  # Track seen document IDs for deduplication
             from_position = 0
             page_size = 1000
             
             # Use pagination instead of scroll
-            while len(all_results) < total_hits:
-                if max_results is not None and len(all_results) >= max_results:
+            while result_num < total_hits:
+                if max_results is not None and result_num >= max_results:
                     break
                     
                 # Update from position in the query
-                search_query = query.copy()
+                search_query = self.keyword_query(query_text)
                 search_query["from"] = from_position
                 search_query["size"] = page_size
                 
@@ -468,25 +474,21 @@ class ElasticsearchService:
                         
                     seen_ids.add(doc_id)
                     source["_score"] = hit["_score"]
-                    all_results.append(source)
-                    
-                    # Stop if we've reached max_results
-                    if max_results is not None and len(all_results) >= max_results:
-                        break
+                    yield source
                 
                 # Move to next page
                 from_position += page_size
-                
+                result_num += len(hits)
                 # Log progress for large result sets
-                if len(all_results) % 5000 == 0:
-                    logger.info(f"Retrieved {len(all_results)} results so far")
+                if result_num % 5000 == 0:
+                    logger.info(f"Retrieved {result_num} results so far")
             
-            logger.info(f"Retrieved {len(all_results)} total deduplicated results")
-            return all_results
+            logger.info(f"Retrieved {result_num} total deduplicated results")
             
         except Exception as e:
             logger.error(f"Error in text search: {str(e)}")
-            return []
+            return
+        
     
     async def close(self):
         """Close the Elasticsearch client connection."""
@@ -500,3 +502,4 @@ class ElasticsearchService:
     async def __aexit__(self, exc_type, exc_value, traceback):
         await self.close()
         self.client = None
+

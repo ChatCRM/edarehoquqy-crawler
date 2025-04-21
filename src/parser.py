@@ -3,10 +3,13 @@ from typing import Dict, Any, Optional, List, Set
 from datetime import datetime
 import logging
 from lxml import html
-from hazm import Normalizer
+# from hazm import Normalizer
 import time
 import jdatetime
 import re
+
+
+Normalizer = lambda x: x
 
 logger = logging.getLogger(__name__)
 

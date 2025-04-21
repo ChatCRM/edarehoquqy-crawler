@@ -173,3 +173,6 @@ output/
 test.py
 test.html
 parsed_content.json
+
+*html
+*json

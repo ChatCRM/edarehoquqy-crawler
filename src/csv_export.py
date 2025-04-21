@@ -9,15 +9,89 @@ import csv
 from pathlib import Path
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
+from pydantic import BaseModel, Field
 
 from src.elasticsearch_service import ElasticsearchService
 
 load_dotenv()
 
+
 total_ids = set()
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+"""
+        "id_edarehoquqy": {
+          "type": "keyword"
+        },
+        "id_ghavanin": {
+          "type": "text",
+          "fields": {
+            "keyword": {
+              "type": "keyword",
+              "ignore_above": 256
+            }
+          }
+        },
+        "metadata": {
+          "properties": {
+            "file_id": {
+              "type": "keyword"
+            },
+            "file_number": {
+              "type": "keyword",
+              "null_value": "نامشخص"
+            },
+            "opinion_date": {
+              "properties": {
+                "gregorian": {
+                  "type": "date",
+                  "format": "yyyy/MM/dd",
+                  "null_value": "0001/01/01"
+                },
+                "shamsi": {
+                  "type": "keyword",
+                  "null_value": "0001/01/01"
+                }
+              }
+            },
+            "opinion_number": {
+              "type": "keyword",
+              "null_value": "نامشخص"
+            }
+          }
+        },
+"""
+class Metadata(BaseModel):
+    file_id: str
+    file_number: str
+    opinion_date: dict
+    opinion_number: str
+
+    @property
+    def opinion_date(self) -> str:
+        return self.opinion_date['shamsi']
+    
+    @property
+    def opinion_date_gregorian(self) -> str:
+        return self.opinion_date['gregorian']
+    
+    
+
+class EdarehoquqyDocument(BaseModel):
+    id_edarehoquqy: str 
+    question: str
+    answer: str
+    summary: str = Field(default="")
+    title: str = Field(default="")
+    metdata: dict
+
+    @property
+    def metadata(self) -> Metadata:
+        return Metadata(**self.metdata)
+    
+
 
 
 async def get_doc_title(client: AsyncOpenAI, doc: str) -> dict:
@@ -188,9 +262,37 @@ async def main():
             logger.info(f"Processing keyword: {keyword}")
             data = await get_data(es, "edarehoquqy", keyword, max_results=10)
             if data:
+                # Text export
                 text_content = await export_to_text(data, client)
                 output_dir = Path.home() / "edarehoquqy-output"
                 await save_file(output_dir / f"{keyword}.txt", text_content)
+                
+                # HTML export (if imported)
+                try:
+                    from src.html_export import export_documents_to_html
+                    
+                    # Convert raw data to EdarehoquqyDocument objects
+                    documents = []
+                    for doc_data in data:
+                        # Convert each document to proper object format
+                        doc_obj = EdarehoquqyDocument(
+                            id_edarehoquqy=doc_data.get('id_edarehoquqy', ''),
+                            question=doc_data.get('question', ''),
+                            answer=doc_data.get('answer', ''),
+                            summary=doc_data.get('summary', ''),
+                            title=doc_data.get('title', ''),
+                            metdata=doc_data.get('metadata', {})
+                        )
+                        documents.append(doc_obj)
+                    
+                    # Export to HTML files
+                    html_output_dir = Path.home() / "edarehoquqy-html-output" / keyword
+                    await export_documents_to_html(documents, html_output_dir)
+                    logger.info(f"Exported HTML files for '{keyword}'")
+                except ImportError:
+                    logger.info("HTML export module not available, skipping HTML export")
+                except Exception as e:
+                    logger.error(f"Error during HTML export: {e}")
                 
                 logger.info(f"Exported {len(data)} documents for '{keyword}'")
     

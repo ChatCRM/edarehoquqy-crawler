@@ -1,156 +1,133 @@
-# HTML Processing and Indexing System
+# EdarehoquqyDocument HTML Converter
 
-This system processes HTML files from a directory structure, parses them, generates embeddings, and indexes them in Elasticsearch. It uses asynchronous processing with queues and workers to efficiently handle large numbers of files.
+This tool converts EdarehoquqyDocument objects to HTML files with a clean, Markdown-like style. The generated HTML files are right-to-left and optimized for Persian legal documents.
 
 ## Features
 
-- Asynchronous processing with queues and workers
-- Rate limiting and concurrency control
-- Error handling and retries
-- Configurable number of workers and queue sizes
-- Elasticsearch integration with vector search support
-- OpenAI embeddings integration
-
-## Requirements
-
-- Python 3.12 or higher
-- Elasticsearch 8.x
-- OpenAI API key
-
-## Installation
-
-1. Clone the repository:
-   ```bash
-   git clone https://github.com/yourusername/edarehoquqy-crawler.git
-   cd edarehoquqy-crawler
-   ```
-
-2. Create a virtual environment and install dependencies:
-   ```bash
-   python -m venv venv
-   source venv/bin/activate  # On Windows: venv\Scripts\activate
-   pip install -e .
-   ```
-
-3. Set up environment variables:
-   ```bash
-   cp .env.example .env
-   ```
-   
-   Edit the `.env` file to include your OpenAI API key, Elasticsearch credentials, and other configuration options:
-   ```
-   # Output directory
-   OUTPUT_DIR=../output
-
-   # Worker configuration
-   NUM_PARSER_WORKERS=5
-   NUM_EMBEDDING_WORKERS=3
-   NUM_INDEXING_WORKERS=5
-
-   # Queue sizes
-   PARSER_QUEUE_SIZE=100
-   EMBEDDING_QUEUE_SIZE=100
-   INDEXING_QUEUE_SIZE=100
-
-   # Elasticsearch configuration
-   ELASTICSEARCH_INDEX=edarehoquqy
-   ELASTICSEARCH_HOST=http://localhost:9200
-   ELASTICSEARCH_USERNAME=elastic
-   ELASTICSEARCH_PASSWORD=your_password
-
-   # OpenAI API configuration for embeddings
-   OPENAI_API_KEY=your_openai_api_key
-
-   # Optional metadata file path
-   METADATA_FILE=
-   ```
+- Converts EdarehoquqyDocument objects to HTML files
+- Support for batch conversion of multiple files
+- Clean, readable HTML output with responsive design
+- Right-to-left text direction for Persian content
+- Maintains document structure (metadata, question, answer, summary)
+- Automatic title generation for documents
 
 ## Usage
 
-Run the processor with settings from your .env file:
+### From Python Code
+
+```python
+from pathlib import Path
+from src.csv_export import EdarehoquqyDocument
+from src.html_export import export_documents_to_html
+
+# Create EdarehoquqyDocument objects
+documents = [
+    EdarehoquqyDocument(
+        id_edarehoquqy="ABC123",
+        question="سوال حقوقی نمونه",
+        answer="پاسخ به سوال حقوقی",
+        summary="خلاصه سند",
+        title="عنوان نظریه حقوقی",
+        metdata={
+            "file_id": "FILE_001",
+            "file_number": "789/XYZ",
+            "opinion_date": {
+                "shamsi": "1402/04/05",
+                "gregorian": "2023/06/26"
+            },
+            "opinion_number": "123/456"
+        }
+    )
+]
+
+# Export to HTML
+output_dir = Path("./html-output")
+await export_documents_to_html(documents, output_dir)
+```
+
+### Command Line Tool
+
+The package includes a command-line tool for converting JSON files to HTML:
 
 ```bash
-python -m src.main
+# Convert a single file
+python -m src.html_converter path/to/document.json -o output/directory
+
+# Convert all JSON files in a directory
+python -m src.html_converter path/to/documents/directory -b -o output/directory
+
+# Generate titles for documents that don't have them
+python -m src.html_converter path/to/document.json -o output/directory -t
 ```
 
-The application will automatically load configuration from the .env file. You can override any setting by modifying the .env file.
+Command-line options:
 
-### Environment Variables
+- `-o, --output-dir`: Output directory (default: ./html-output)
+- `-b, --batch`: Batch mode - treat input as a directory and convert all JSON files
+- `-p, --pattern`: File pattern to match in batch mode (default: *.json)
+- `-t, --generate-titles`: Generate titles for documents that don't have them
 
-All configuration can be set through environment variables:
+## Sample JSON Format
 
-- `OUTPUT_DIR`: Path to the output directory (default: "../output")
-- `NUM_PARSER_WORKERS`: Number of parser workers (default: 5)
-- `NUM_EMBEDDING_WORKERS`: Number of embedding workers (default: 3)
-- `NUM_INDEXING_WORKERS`: Number of indexing workers (default: 5)
-- `PARSER_QUEUE_SIZE`: Size of the parser queue (default: 100)
-- `EMBEDDING_QUEUE_SIZE`: Size of the embedding queue (default: 100)
-- `INDEXING_QUEUE_SIZE`: Size of the indexing queue (default: 100)
-- `ELASTICSEARCH_INDEX`: Name of the Elasticsearch index (default: "edarehoquqy")
-- `ELASTICSEARCH_HOST`: Elasticsearch host URL (default: "http://localhost:9200")
-- `ELASTICSEARCH_USERNAME`: Elasticsearch username (optional)
-- `ELASTICSEARCH_PASSWORD`: Elasticsearch password (optional)
-- `OPENAI_API_KEY`: OpenAI API key for generating embeddings
-- `METADATA_FILE`: Path to a JSON file containing metadata (optional)
-
-## Directory Structure
-
-The system expects the following directory structure:
-
-```
-output/
-  ├── id1/
-  │   └── id1.html
-  ├── id2/
-  │   └── id2.html
-  └── ...
-```
-
-Where each directory is named with an ID, and contains an HTML file with the same name.
-
-## Customizing the Parser
-
-The current implementation includes a placeholder parser. To customize it, edit the `HTMLParser` class in `src/parser.py` to implement your specific parsing logic.
-
-## Metadata
-
-You can provide additional metadata to be included in the indexed documents by passing a JSON file with the `--metadata-file` argument. The metadata will be merged with the document metadata.
-
-Example metadata.json:
+The input JSON files should have the following structure:
 
 ```json
 {
-  "source": "edarehoquqy",
-  "language": "fa",
-  "collection": "legal_opinions"
-}
-```
-
-## Elasticsearch Index
-
-The system creates an Elasticsearch index with the following mapping:
-
-```json
-{
-  "mappings": {
-    "properties": {
-      "question": {"type": "text"},
-      "answer": {"type": "text"},
-      "date": {"type": "date"},
-      "metadata": {"type": "object"},
-      "embedding": {
-        "type": "dense_vector",
-        "dims": 3072,
-        "index": true,
-        "similarity": "cosine"
-      }
+    "id_edarehoquqy": "ABC123",
+    "question": "متن سوال حقوقی در اینجا",
+    "answer": "متن پاسخ به سوال حقوقی در اینجا",
+    "summary": "خلاصه نظر در اینجا",
+    "title": "عنوان نظریه حقوقی",
+    "metdata": {
+        "file_id": "FILE_001",
+        "file_number": "789/XYZ",
+        "opinion_date": {
+            "shamsi": "1402/04/05",
+            "gregorian": "2023/06/26"
+        },
+        "opinion_number": "123/456"
     }
-  }
 }
 ```
 
-This mapping supports vector search using the `embedding` field.
+## Title Generation
+
+If a document doesn't have a title, you can use the `-t` option to generate one automatically using OpenAI's API. The tool will:
+
+1. Extract the question and answer from the document
+2. Send them to the OpenAI API to generate a concise, descriptive title
+3. Use the generated title in the HTML output
+
+If you don't use the `-t` option and a document doesn't have a title, the tool will use the opinion number as the title.
+
+## Generated HTML Structure
+
+The generated HTML files follow a consistent structure:
+
+1. Document title (from title field or generated)
+2. Metadata section (document ID, file numbers, dates)
+3. Summary section (if available)
+4. Question section
+5. Answer section
+6. Footer with issue date
+
+A sample HTML template is available in `templates/document_template.html`.
+
+## Integration with Main Script
+
+The HTML converter is integrated with the main CSV export script. When running the main script, it will:
+
+1. Search for documents based on keywords
+2. Generate text summaries 
+3. Export to both text and HTML formats
+
+## Requirements
+
+- Python 3.7+
+- aiofiles
+- pathlib
+- openai (for title generation)
 
 ## License
 
-This project is licensed under the terms of the license included in the repository.
+This project is licensed under the MIT License.
