@@ -7,8 +7,9 @@ import sys
 from pathlib import Path
 import os
 from openai import AsyncOpenAI
-from typing import Tuple, AsyncGenerator, List, Optional
-
+from typing import Tuple, AsyncGenerator, List, Optional, Union, Dict
+import aiofiles
+from aiopath import AsyncPath
 from src.csv_export import save_file, get_each_doc_summary, get_doc_title, EdarehoquqyDocument
 from src.html_export import document_to_html, save_html_file
 from src.elasticsearch_service import ElasticsearchService
@@ -219,7 +220,50 @@ QUERY_LIST = [
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-async def get_data(query_list: List[str], client: AsyncOpenAI) -> AsyncGenerator[Tuple[EdarehoquqyDocument, str], None]:
+async def check_if_document_exists(output_dir: str, id_edarehoquqy: str) -> Union[bool, EdarehoquqyDocument]:
+    """
+    Check if a document with the given ID exists in the output directory.
+    
+    Args:
+        output_dir: Path to the output directory
+        id_edarehoquqy: ID of the document to check
+        
+    Returns:
+        True if the document exists, False otherwise
+    """
+    file_path = AsyncPath(output_dir) / id_edarehoquqy
+    if not file_path.exists():
+        return False
+    json_file = file_path / f"{id_edarehoquqy}.json"
+    if not json_file.exists():
+        return False
+    async with aiofiles.open(json_file, mode='r', encoding='utf-8') as f:
+        data = await f.read()
+    return json.loads(data, object_hook=lambda d: EdarehoquqyDocument(**d))
+
+async def get_all_existing_ids(output_dir: str) -> Dict[str, EdarehoquqyDocument]:
+    """
+    Get all existing document IDs from the output directory.
+    
+    Args:
+        output_dir: Path to the output directory
+        
+    Returns:
+        Dict of existing document IDs and their corresponding EdarehoquqyDocument objects
+    """
+    existing_ids = {}
+    for file_path in AsyncPath(output_dir).glob('**/*.json'):
+        id_edarehoquqy = file_path.stem
+        keyword = file_path.parent.name
+        file_path = AsyncPath(output_dir) / keyword / id_edarehoquqy
+        if await file_path.exists():
+            existing_ids[id_edarehoquqy] = file_path
+    return existing_ids
+
+
+
+
+async def get_data(query_list: List[str], client: AsyncOpenAI, output_dir: str = "../html-output") -> AsyncGenerator[Tuple[EdarehoquqyDocument, str], None]:
     """
     Retrieve documents from Elasticsearch based on query list.
     
@@ -240,6 +284,7 @@ async def get_data(query_list: List[str], client: AsyncOpenAI) -> AsyncGenerator
     username = os.getenv("ELASTICSEARCH_USERNAME")
 
     processed_files = set()
+    existing_ids = await get_all_existing_ids(output_dir)
     
     es_service = None
     try:
@@ -271,12 +316,17 @@ async def get_data(query_list: List[str], client: AsyncOpenAI) -> AsyncGenerator
                     
                     for source in results:
                         document_count += 1
-                        if source.get("id_edarehoquqy") in processed_files:
-                            logger.info(f"Already processed file with ID: {source.get("id_edarehoquqy")}")
-                            continue
+                        doc_id = source.get('id_edarehoquqy')
+                        if doc_id in existing_ids:
+                            logger.info(f"Already processed file with ID: {doc_id}")
+                            doc_path = existing_ids[doc_id] / doc_id
+                            if doc := await check_if_document_exists(doc_path, doc_id):
+                                logger.info(f"Loaded document from {doc_path}")
+                                yield doc, query
+                                continue
 
                         doc = EdarehoquqyDocument(
-                            id_edarehoquqy=source.get('id_edarehoquqy', ''),
+                            id_edarehoquqy=doc_id,
                             question=source.get('question', ''),
                             answer=source.get('answer', ''),
                             content=source.get('content', ''),
