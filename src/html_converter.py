@@ -5,6 +5,7 @@ import json
 import logging
 import sys
 from pathlib import Path
+import re
 import os
 from openai import AsyncOpenAI
 from typing import Tuple, AsyncGenerator, List, Optional, Union, Dict
@@ -14,7 +15,7 @@ from src.csv_export import save_file, get_each_doc_summary, get_doc_title, Edare
 from src.html_export import document_to_html, save_html_file
 from src.elasticsearch_service import ElasticsearchService
 
-QUERY_LIST = [
+QUERY_LIST_V1 = [
     "تصرف عدوانی",
     "خلع ید",
     "ممانعت از حق",
@@ -216,9 +217,55 @@ QUERY_LIST = [
     "ابطال سود مازاد بانکی"
 ]
 
+# Initialize the query dictionary with query names as keys and lists of search phrases as values
+QUERY_LIST = {
+    "تصرف عدوانی": [
+        "منع تصرف غیرمجاز املاک",
+        "گرفتن ملک دیگری بدون اجازه",
+        "استفاده بدون اجازه از مال غیرمنقول",
+        "تصرف بدون مجوز",
+        "تجاوز به حقوق مالکانه",
+        "رفع تصرف عدوانی",
+        "مالکیت و حق تصرف",
+        "دعاوی تصرف عدوانی",
+        "دفاع از حق تصرف",
+        "اثبات تصرف سابق"
+    ]
+}
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+def transform_query(query: str) -> List[str]:
+    """
+    Split a hyphen‑separated list of phrases into a List[str].
+    E.g. "foo - bar baz- qux" -> ["foo", "bar baz", "qux"]
+    
+    Args:
+        query: A string with phrases separated by hyphens, or a list
+        
+    Returns:
+        List of non-empty phrases
+    """
+    # If already a list, filter empty items and return
+    if isinstance(query, list):
+        return [p.strip() for p in query if p and p.strip()]
+        
+    # Handle string input
+    logger.info(f"Transforming query: {query}")
+    if not query or not isinstance(query, str):
+        logger.warning(f"Invalid query type or empty query: {type(query)}")
+        return []
+        
+    # Split by hyphens
+    parts = re.split(r"\s*-\s*", query)
+    
+    # Filter out empty parts and strip whitespace
+    result = [p.strip() for p in parts if p and p.strip()]
+    
+    logger.info(f"Transformed to {len(result)} phrases: {result}")
+    return result
+
 
 async def check_if_document_exists(output_dir: str, id_edarehoquqy: str) -> Union[bool, EdarehoquqyDocument]:
     """
@@ -241,7 +288,7 @@ async def check_if_document_exists(output_dir: str, id_edarehoquqy: str) -> Unio
         data = await f.read()
     return json.loads(data, object_hook=lambda d: EdarehoquqyDocument(**d))
 
-async def get_all_existing_ids(output_dir: str) -> Dict[str, EdarehoquqyDocument]:
+async def get_all_existing_ids(output_dir: str) -> Dict[str, AsyncPath]:
     """
     Get all existing document IDs from the output directory.
     
@@ -249,80 +296,118 @@ async def get_all_existing_ids(output_dir: str) -> Dict[str, EdarehoquqyDocument
         output_dir: Path to the output directory
         
     Returns:
-        Dict of existing document IDs and their corresponding EdarehoquqyDocument objects
+        Dict of existing document IDs and their corresponding file paths
     """
     existing_ids = {}
-    for file_path in AsyncPath(output_dir).glob('**/*.json'):
-        id_edarehoquqy = file_path.stem
-        keyword = file_path.parent.name
-        file_path = AsyncPath(output_dir) / keyword / id_edarehoquqy
-        if await file_path.exists():
-            existing_ids[id_edarehoquqy] = file_path
+    output_path = AsyncPath(output_dir)
+    
+    if not await output_path.exists():
+        return existing_ids
+        
+    async for file_path in output_path.glob('**/*.json'):
+        try:
+            id_edarehoquqy = file_path.stem
+            keyword = file_path.parent.name
+            dir_path = AsyncPath(output_dir) / keyword / id_edarehoquqy
+            if await dir_path.exists():
+                existing_ids[id_edarehoquqy] = dir_path
+        except Exception as e:
+            logger.error(f"Error processing file {file_path}: {e}")
+    
     return existing_ids
 
 
 
-
-async def get_data(query_list: List[str], client: AsyncOpenAI, output_dir: str = "../html-output") -> AsyncGenerator[Tuple[EdarehoquqyDocument, str], None]:
+async def get_data(query_list: Union[List[str], Dict[str, str]], client: AsyncOpenAI, output_dir: str = "../html-output") -> AsyncGenerator[Tuple[EdarehoquqyDocument, str], None]:
     """
     Retrieve documents from Elasticsearch based on query list.
     
     Args:
         query_list: List of queries to search for
         client: Optional OpenAI client for generating titles and summaries
-        max_results: Maximum number of results to return per query. If None, returns all matching documents.
+        output_dir: Directory to save output files
         
     Yields:
         EdarehoquqyDocument objects with data from Elasticsearch + Query in a Tuple in the same order
     """
-    if ElasticsearchService is None:
-        logger.error("ElasticsearchService not available. Cannot retrieve documents from Elasticsearch.")
-        return
-        
-    hosts = os.getenv("ELASTICSEARCH_HOST")
-    password = os.getenv("ELASTICSEARCH_PASSWORD")
-    username = os.getenv("ELASTICSEARCH_USERNAME")
-
-    processed_files = set()
-    existing_ids = await get_all_existing_ids(output_dir)
     
     es_service = None
+    
     try:
+        hosts = os.getenv("ELASTICSEARCH_HOST")
+        password = os.getenv("ELASTICSEARCH_PASSWORD")
+        username = os.getenv("ELASTICSEARCH_USERNAME")
+
+        processed_files = set()
+        existing_ids = await get_all_existing_ids(output_dir)
         # Create ES service
         es_service = ElasticsearchService(
             hosts=[hosts], 
             password=password, 
             username=username,
-            timeout=30,  # Reduced timeout for faster failure
+            timeout=120,  # Increased timeout for slower connections
             retry_on_timeout=True,
-            max_retries=3
+            max_retries=5  # Increased retry count
         )
         
         # Try to connect and ensure index exists
         await es_service.ensure_index_exists()
         
-        for query in query_list:
-            logger.info(f"Searching for documents matching query: '{query}'")
+        for query_name, query_text in query_list.items():
+            logger.info(f"Searching for documents matching query: '{query_name}'")
             
             try:
                 document_count = 0
-                async for batch in es_service.search_by_text_batch(query):
+                # Ensure query_text is a list of phrases
+                query_phrases = query_text
+                if isinstance(query_text, str):
+                    query_phrases = transform_query(query_text)
+                
+                # Set parameters based on the number of phrases
+                num_phrases = len(query_phrases) if isinstance(query_phrases, list) else 1
+                
+                # Adjust min_score based on phrase count - more phrases = higher score requirement
+                # because more phrases have more chances to match and get points
+                min_score = 1.5  # Base value
+                if num_phrases > 5:
+                    min_score = 2.0
+                elif num_phrases > 2:
+                    min_score = 2.5
+                
+                
+                max_results = None
+                logger.info(f"Searching with {num_phrases} phrases, min_score={min_score}, max_results={max_results}")
+                
+                # Execute search with dynamic parameters
+                async for batch in es_service.search_by_text_batch(
+                    query_phrases, 
+                    min_score=min_score, 
+                    max_results=max_results
+                ):
                     if batch is None:
                         continue
                         
                     # Extract the results list from the batch
-                    # Batches are dictionaries with a "results" key or a "total_count" and "results" keys
                     results = batch.get("results", [])
+                    relevant_count = batch.get("relevant_count", len(results))
+                    total_count = batch.get("total_count", 0)
+                    precision = batch.get("precision", 0)
+                    
+                    logger.info(f"Processing batch with {len(results)} results (relevant: {relevant_count} of {total_count} total, precision: {precision:.1%})")
                     
                     for source in results:
                         document_count += 1
                         doc_id = source.get('id_edarehoquqy')
+                        if not doc_id:
+                            logger.warning(f"Missing id_edarehoquqy in document: {source.keys()}")
+                            continue
+                            
                         if doc_id in existing_ids:
                             logger.info(f"Already processed file with ID: {doc_id}")
                             doc_path = existing_ids[doc_id] / doc_id
                             if doc := await check_if_document_exists(doc_path, doc_id):
                                 logger.info(f"Loaded document from {doc_path}")
-                                yield doc, query
+                                yield doc, query_name
                                 continue
 
                         doc = EdarehoquqyDocument(
@@ -343,10 +428,14 @@ async def get_data(query_list: List[str], client: AsyncOpenAI, output_dir: str =
                         logger.info(f"Generated title and summary for document {doc.id_edarehoquqy}")
                         processed_files.add(doc.id_edarehoquqy)
                         
-                        yield doc, query
-                logger.info(f"Processed {document_count} documents for query: '{query}'")
+                        yield doc, query_name
+                        
+                logger.info(f"Processed {document_count} documents for query: '{query_name}'")
+                if document_count == 0:
+                    logger.warning(f"No documents found for query: '{query_name}'. Try lowering min_score or adjusting the query.")
+                    
             except Exception as e:
-                logger.error(f"Error searching for query '{query}': {e}")
+                logger.error(f"Error searching for query '{query_name}': {e}")
                 continue
     except Exception as e:
         logger.error(f"Error connecting to Elasticsearch: {e}")
@@ -403,7 +492,7 @@ async def load_file_as_document(file_path: Path, client: AsyncOpenAI = None) -> 
         logger.error(f"Error loading document from {file_path}: {e}")
         return None
 
-async def convert_and_save_documents(query_list: List[str], output_dir: Path, client: AsyncOpenAI = None) -> List[Path]:
+async def convert_and_save_documents(query_list: Union[List[str], Dict[str, str]], output_dir: Path, client: AsyncOpenAI = None) -> List[Path]:
     """
     Convert and save documents retrieved from Elasticsearch to HTML files.
     
@@ -411,7 +500,6 @@ async def convert_and_save_documents(query_list: List[str], output_dir: Path, cl
         query_list: List of queries to search for in Elasticsearch
         output_dir: Directory to save HTML files to
         client: Optional AsyncOpenAI client for generating titles/summaries
-        max_results: Maximum number of results to return per query. If None, returns all matching documents.
         
     Returns:
         List of paths to saved HTML files
@@ -432,31 +520,35 @@ async def convert_and_save_documents(query_list: List[str], output_dir: Path, cl
     
     logger.info(f"Converting and saving documents for queries: {query_list}")
     
-    # Process each document
-    async for doc_data, query in get_data(query_list, client):
-        document_counter += 1
+    try:
+        # Process each document
+        async for doc_data, query in get_data(query_list, client, str(output_dir)):
+            document_counter += 1
+            
+            try:
+                # Create query-specific subdirectory
+                query_dir = output_dir / query.replace('/', '_').replace(' ', '_') / doc_data.id_edarehoquqy.replace('/', '_')
+                os.makedirs(query_dir, exist_ok=True)
+                
+                # Save document as HTML with embedded font
+                html_path = await save_html_file(doc_data, query_dir, font_path=font_path)
+                saved_files.append(html_path)
+                
+                logger.info(f"Saved document {document_counter} as HTML: {html_path}")
+                
+            except Exception as e:
+                logger.error(f"Error processing document {doc_data.id_edarehoquqy}: {e}")
+                import traceback
+                logger.error(traceback.format_exc())
+    
+        if not saved_files:
+            logger.warning("No documents were retrieved from Elasticsearch. Check your queries and connection settings.")
         
-        try:
-            # Create query-specific subdirectory
-            query_dir = output_dir / query.replace('/', '_').replace(' ', '_') / doc_data.id_edarehoquqy.replace('/', '_')
-            os.makedirs(query_dir, exist_ok=True)
-            
-            # Save document as HTML with embedded font
-            html_path = await save_html_file(doc_data, query_dir, font_path=font_path)
-            saved_files.append(html_path)
-            
-            logger.info(f"Saved document {document_counter} as HTML: {html_path}")
-            
-        except Exception as e:
-            logger.error(f"Error processing document {doc_data.id_edarehoquqy}: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
-    
-    if not saved_files:
-        logger.warning("No documents were retrieved from Elasticsearch. Check your queries and connection settings.")
-    
-    logger.info(f"Converted and saved {len(saved_files)} documents to {output_dir}")
-    return saved_files
+        logger.info(f"Converted and saved {len(saved_files)} documents to {output_dir}")
+        return saved_files
+    except Exception as e:
+        logger.error(f"Error retrieving documents from Elasticsearch: {e}")
+        return saved_files
 
 async def convert_files(input_files: List[Path], output_dir: Path, client: AsyncOpenAI = None) -> List[Path]:
     """
@@ -545,14 +637,37 @@ async def main():
                 logger.error("Please make sure the elasticsearch package is installed.")
                 sys.exit(1)
 
+            # Check for required environment variables
+            es_env_vars = ["ELASTICSEARCH_HOST", "ELASTICSEARCH_USERNAME", "ELASTICSEARCH_PASSWORD"]
+            missing_vars = [var for var in es_env_vars if not os.getenv(var)]
+            if missing_vars:
+                logger.error(f"Missing required environment variables: {', '.join(missing_vars)}")
+                logger.error("Please set these environment variables or use the --files option instead.")
+                sys.exit(1)
+
             es_output_dir = output_dir / "search"
             try:
-                query_list = args.queries if args.queries is not None else QUERY_LIST
-                es_results = await convert_and_save_documents(query_list, es_output_dir, client)
+                # Prepare query dictionary
+                search_queries = {}
+                
+                # If specific queries are provided, use those
+                if args.queries:
+                    for query in args.queries:
+                        search_queries[query] = transform_query(query)
+                # Otherwise use the predefined list
+                else:
+                    # Use the predefined QUERY_LIST without modifying it here
+                    logger.info(f"Using predefined query list with {len(QUERY_LIST)} items")
+                    search_queries = QUERY_LIST.copy()
+                
+                logger.info(f"Searching with queries: {search_queries}")
+                es_results = await convert_and_save_documents(search_queries, es_output_dir, client)
                 saved_files.extend(es_results)
             except Exception as e:
                 logger.error(f"Error retrieving documents from Elasticsearch: {e}")
                 logger.error("If you're having connection issues, try using the --files option instead")
+                import traceback
+                logger.error(traceback.format_exc())
         
         # Print results
         logger.info(f"Successfully saved {len(saved_files)} HTML files")
@@ -568,7 +683,10 @@ async def main():
         if 'asyncio' in sys.modules:
             for task in asyncio.all_tasks():
                 if not task.done() and task != asyncio.current_task():
-                    task.cancel()
+                    try:
+                        task.cancel()
+                    except Exception:
+                        pass
 
 if __name__ == "__main__":
     asyncio.run(main()) 
