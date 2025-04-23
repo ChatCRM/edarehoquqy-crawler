@@ -9,8 +9,11 @@ import re
 import os
 from openai import AsyncOpenAI
 from typing import Tuple, AsyncGenerator, List, Optional, Union, Dict
+from pydantic import BaseModel
 import aiofiles
 from aiopath import AsyncPath
+
+
 from src.csv_export import save_file, get_each_doc_summary, get_doc_title, EdarehoquqyDocument
 from src.html_export import document_to_html, save_html_file
 from src.elasticsearch_service import ElasticsearchService
@@ -217,24 +220,89 @@ QUERY_LIST_V1 = [
     "ابطال سود مازاد بانکی"
 ]
 
-# Initialize the query dictionary with query names as keys and lists of search phrases as values
-QUERY_LIST = {
-    "تصرف عدوانی": [
-        "منع تصرف غیرمجاز املاک",
-        "گرفتن ملک دیگری بدون اجازه",
-        "استفاده بدون اجازه از مال غیرمنقول",
-        "تصرف بدون مجوز",
-        "تجاوز به حقوق مالکانه",
-        "رفع تصرف عدوانی",
-        "مالکیت و حق تصرف",
-        "دعاوی تصرف عدوانی",
-        "دفاع از حق تصرف",
-        "اثبات تصرف سابق"
-    ]
-}
-
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+class QueryKeywords(BaseModel):
+    keywords: List[str]
+
+async def get_query_keywords(client: AsyncOpenAI, query: str, max_keywords: int = 12) -> List[str]:
+    """
+    Generate up to a maximum number of relevant search keywords for an Iranian legal query.
+    
+    Args:
+        client: AsyncOpenAI client
+        query: The main legal query or topic (can be in Persian or English)
+        max_keywords: Maximum number of keywords to generate (default: 12)
+        
+    Returns:
+        List of relevant search keywords (maximum of max_keywords)
+    """
+    # Prompt in both Persian and English to handle both types of queries
+    prompt = f"""
+    تولید کلمات کلیدی برای جستجوی حقوقی ایرانی: "{query}"
+
+    هدف: ایجاد حداکثر {max_keywords} کلمه کلیدی برای جستجوی مؤثر در پایگاه داده حقوقی ایران در مورد موضوع "{query}".
+
+    دستورالعمل‌ها:
+    1. اصطلاحات رسمی حقوقی مرتبط با موضوع را در قوانین ایران شناسایی کنید
+    2. شامل اصطلاحات متداول و روزمره که افراد غیر حقوقی ممکن است استفاده کنند
+    3. مواد قانونی مرتبط، شماره‌های ماده و ارجاعات قانونی خاص را در نظر بگیرید
+    4. اصطلاحات مربوط به رویه‌های قضایی و دادرسی مرتبط را شامل کنید
+    5. از منظر خواهان و خوانده به موضوع نگاه کنید
+    6. مترادف‌ها و واریاسیون‌های اصطلاحات کلیدی را شامل کنید
+    7. اصطلاحات مربوط به نتایج، مجازات‌ها یا راه‌حل‌های قانونی را در نظر بگیرید
+    8. عبارات ترکیبی که احتمالاً در متن قوانین یا آرای قضایی وجود دارند
+    9. از کلمات کلیدی مرتبط با رویه قضایی فعلی دادگاه‌های ایران استفاده کنید
+    10. ترکیبی از کلمات تک و عبارات کوتاه را در نظر بگیرید
+
+    فقط لیستی از کلمات کلیدی به زبان فارسی (حداکثر {max_keywords} مورد) را برگردانید که برای بازیابی اسناد مرتبط با "{query}" در یک پایگاه داده حقوقی ایرانی مؤثرترین باشند. فقط کلمات کلیدی را برگردانید، بدون توضیح اضافی.
+
+    ---
+
+    ENGLISH INSTRUCTIONS (FOR BETTER UNDSTANDING OF THE QUERY BUT THE OUTPUT NEEDS TO BE IN PERSIAN!):
+    Generate keyword list for Iranian legal search: "{query}"
+
+    Objective: Create up to {max_keywords} keywords for effective searching in an Iranian legal database regarding "{query}".
+
+    Guidelines:
+    1. Identify formal legal terms related to the topic in Iranian law (in Persian)
+    2. Include common terms that non-legal people might use
+    3. Consider relevant legal articles, article numbers, and specific legal references
+    4. Include terms related to judicial procedures and relevant proceedings
+    5. Look at the issue from both plaintiff and defendant perspectives
+    6. Include synonyms and variations of key terms
+    7. Consider terms related to legal outcomes, penalties, or remedies
+    8. Include compound phrases likely to appear in legal texts or judicial opinions
+    9. Use keywords related to current judicial practice in Iranian courts
+    10. Use a mix of single words and short phrases
+
+    Return ONLY a list of Persian keywords (maximum {max_keywords}) that would be most effective for retrieving documents related to "{query}" in an Iranian legal database. Return only the keywords without additional explanation.
+    """
+    
+    logger.info(f"Generating keywords for query: {query}")
+    try:
+        response = await client.beta.chat.completions.parse(
+            model="gpt-4o-mini", 
+            response_format=QueryKeywords,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=1500,
+            temperature=0.1
+        )
+        
+        keywords = response.choices[0].message.parsed.keywords
+        logger.info(f"output: {response.choices[0].message.parsed}")
+        
+        # Ensure we don't exceed max_keywords
+        result = keywords[:max_keywords]
+        logger.info(f"Generated {len(result)} keywords for '{query}'")
+        return result
+    except Exception as e:
+        logger.error(f"Error generating keywords for '{query}': {e}")
+        # Fallback to basic keywords if there's an error
+        if isinstance(query, str) and query.strip():
+            return [query]
+        return []
 
 def transform_query(query: str) -> List[str]:
     """
@@ -247,7 +315,6 @@ def transform_query(query: str) -> List[str]:
     Returns:
         List of non-empty phrases
     """
-    # If already a list, filter empty items and return
     if isinstance(query, list):
         return [p.strip() for p in query if p and p.strip()]
         
@@ -318,7 +385,7 @@ async def get_all_existing_ids(output_dir: str) -> Dict[str, AsyncPath]:
 
 
 
-async def get_data(query_list: Union[List[str], Dict[str, str]], client: AsyncOpenAI, output_dir: str = "../html-output") -> AsyncGenerator[Tuple[EdarehoquqyDocument, str], None]:
+async def get_data(query_list: List[str], client: AsyncOpenAI, output_dir: str = "../html-output") -> AsyncGenerator[Tuple[EdarehoquqyDocument, str], None]:
     """
     Retrieve documents from Elasticsearch based on query list.
     
@@ -353,21 +420,15 @@ async def get_data(query_list: Union[List[str], Dict[str, str]], client: AsyncOp
         # Try to connect and ensure index exists
         await es_service.ensure_index_exists()
         
-        for query_name, query_text in query_list.items():
-            logger.info(f"Searching for documents matching query: '{query_name}'")
+        for query_text in query_list:
+            logger.info(f"Searching for documents matching query: '{query_text}'")
             
             try:
                 document_count = 0
-                # Ensure query_text is a list of phrases
-                query_phrases = query_text
-                if isinstance(query_text, str):
-                    query_phrases = transform_query(query_text)
-                
                 # Set parameters based on the number of phrases
+                query_phrases = await get_query_keywords(client, query_text)
                 num_phrases = len(query_phrases) if isinstance(query_phrases, list) else 1
                 
-                # Adjust min_score based on phrase count - more phrases = higher score requirement
-                # because more phrases have more chances to match and get points
                 min_score = 1.5  # Base value
                 if num_phrases > 5:
                     min_score = 2.0
@@ -407,7 +468,7 @@ async def get_data(query_list: Union[List[str], Dict[str, str]], client: AsyncOp
                             doc_path = existing_ids[doc_id] / doc_id
                             if doc := await check_if_document_exists(doc_path, doc_id):
                                 logger.info(f"Loaded document from {doc_path}")
-                                yield doc, query_name
+                                yield doc, query_text
                                 continue
 
                         doc = EdarehoquqyDocument(
@@ -428,14 +489,14 @@ async def get_data(query_list: Union[List[str], Dict[str, str]], client: AsyncOp
                         logger.info(f"Generated title and summary for document {doc.id_edarehoquqy}")
                         processed_files.add(doc.id_edarehoquqy)
                         
-                        yield doc, query_name
+                        yield doc, query_text
                         
-                logger.info(f"Processed {document_count} documents for query: '{query_name}'")
+                logger.info(f"Processed {document_count} documents for query: '{query_text}'")
                 if document_count == 0:
-                    logger.warning(f"No documents found for query: '{query_name}'. Try lowering min_score or adjusting the query.")
+                    logger.warning(f"No documents found for query: '{query_text}'. Try lowering min_score or adjusting the query.")
                     
             except Exception as e:
-                logger.error(f"Error searching for query '{query_name}': {e}")
+                logger.error(f"Error searching for query '{query_text}': {e}")
                 continue
     except Exception as e:
         logger.error(f"Error connecting to Elasticsearch: {e}")
@@ -492,7 +553,7 @@ async def load_file_as_document(file_path: Path, client: AsyncOpenAI = None) -> 
         logger.error(f"Error loading document from {file_path}: {e}")
         return None
 
-async def convert_and_save_documents(query_list: Union[List[str], Dict[str, str]], output_dir: Path, client: AsyncOpenAI = None) -> List[Path]:
+async def convert_and_save_documents(query_list: List[str], output_dir: Path, client: AsyncOpenAI = None) -> List[Path]:
     """
     Convert and save documents retrieved from Elasticsearch to HTML files.
     
@@ -605,6 +666,8 @@ async def main():
     parser.add_argument("-f", "--files", nargs="*", help="JSON files to convert to HTML")
     parser.add_argument("-o", "--output-dir", help="Output directory (default: ./html-output)",
                        default="./html-output")
+    parser.add_argument("-k", "--generate-keywords", action="store_true", 
+                        default=True, help="Generate keywords for each query (uses OpenAI API)")
     
     args = parser.parse_args()
     
@@ -647,21 +710,8 @@ async def main():
 
             es_output_dir = output_dir / "search"
             try:
-                # Prepare query dictionary
-                search_queries = {}
-                
-                # If specific queries are provided, use those
-                if args.queries:
-                    for query in args.queries:
-                        search_queries[query] = transform_query(query)
-                # Otherwise use the predefined list
-                else:
-                    # Use the predefined QUERY_LIST without modifying it here
-                    logger.info(f"Using predefined query list with {len(QUERY_LIST)} items")
-                    search_queries = QUERY_LIST.copy()
-                
-                logger.info(f"Searching with queries: {search_queries}")
-                es_results = await convert_and_save_documents(search_queries, es_output_dir, client)
+                logger.info(f"Searching with queries: {QUERY_LIST_V1}")
+                es_results = await convert_and_save_documents(QUERY_LIST_V1, es_output_dir, client)
                 saved_files.extend(es_results)
             except Exception as e:
                 logger.error(f"Error retrieving documents from Elasticsearch: {e}")

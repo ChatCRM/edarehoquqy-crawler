@@ -86,14 +86,18 @@ async def get_doc_title(client: AsyncOpenAI, doc: str) -> str:
         A string containing the generated title
     """
     prompt = f"""
-    Create a precise Persian title (10-11 words) for this Iranian legal document that captures its core legal issue.
+    Generate a precise, searchable Persian title (10-12 words) for this Iranian legal document in Q&A format.
     
     The title should:
     - Be in Persian
-    - Be in 10-11 words
-    - Use precise Iranian legal terminology
-    - Be specific enough to distinguish this document
-    - Don't use unnecessary words for description.
+    - Extract key legal terms/concepts directly from the question and answer
+    - Include the main legal issue, parties involved, and legal principle addressed
+    - Capture both what is being asked and what is concluded in the answer
+    - Use precise Iranian legal terminology that matches terms in the document
+    - Include relevant statute numbers, laws, or legal principles if mentioned
+    - Be specific enough to distinguish this document from similar legal questions
+    - Be searchable - include keywords someone would use to find this document
+    - Avoid generic descriptions or unnecessary words
     - Be formatted as JSON with only a "title" field
     
     Document:
@@ -102,10 +106,10 @@ async def get_doc_title(client: AsyncOpenAI, doc: str) -> str:
 
     try:
         response = await client.chat.completions.create(
-            model="gpt-4.1-nano-2025-04-14",  # Using the more capable model for better title generation
+            model="gpt-4.1-mini-2025-04-14",  # Using the more capable model for better title generation
             messages=[{"role": "user", "content": prompt}],
             response_format={"type": "json_object"},
-            temperature=0.3  # Lower temperature for more focused, precise titles
+            temperature=0.1  # Lower temperature for more focused, precise titles
         )
         # Parse the JSON response and handle potential errors
         content = response.choices[0].message.content
