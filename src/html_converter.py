@@ -226,14 +226,14 @@ logger = logging.getLogger(__name__)
 class QueryKeywords(BaseModel):
     keywords: List[str]
 
-async def get_query_keywords(client: AsyncOpenAI, query: str, max_keywords: int = 12) -> List[str]:
+async def get_query_keywords(client: AsyncOpenAI, query: str, max_keywords: int = 15) -> List[str]:
     """
     Generate up to a maximum number of relevant search keywords for an Iranian legal query.
     
     Args:
         client: AsyncOpenAI client
         query: The main legal query or topic (can be in Persian or English)
-        max_keywords: Maximum number of keywords to generate (default: 12)
+        max_keywords: Maximum number of keywords to generate (default: 15)
         
     Returns:
         List of relevant search keywords (maximum of max_keywords)
@@ -286,17 +286,17 @@ async def get_query_keywords(client: AsyncOpenAI, query: str, max_keywords: int 
             model="gpt-4.1-mini-2025-04-14", 
             response_format=QueryKeywords,
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=1500,
+            max_tokens=2000,
             temperature=0.1
         )
         
         keywords = response.choices[0].message.parsed.keywords
-        logger.info(f"output: {response.choices[0].message.parsed}")
-        
-        # Ensure we don't exceed max_keywords
-        result = keywords[:max_keywords]
-        logger.info(f"Generated {len(result)} keywords for '{query}'")
-        return result
+        results = [query]  # Ensure the query is the first item in the list
+        if len(keywords) > max_keywords:
+            results.extend(keywords[:max_keywords])
+        else:
+            results.extend(keywords)
+        return results
     except Exception as e:
         logger.error(f"Error generating keywords for '{query}': {e}")
         # Fallback to basic keywords if there's an error
