@@ -519,6 +519,119 @@ class ElasticsearchService:
                     await self.client.clear_scroll(scroll_id=scroll_id)
                 except Exception as e:
                     logger.warning(f"Failed to clear scroll: {e}")
+    
+    async def get_missing_documents(self, existing_ids: List[str]) -> AsyncGenerator[Dict[str, Any], None]:
+        """
+        Get documents that are not present in Elasticsearch.
+        
+        Args:
+            existing_ids: List of document IDs that are already indexed
+            
+        Returns:
+            AsyncGenerator[Dict[str, Any], None]: Generator yielding documents missing from Elasticsearch
+        """
+        if not existing_ids:
+            logger.warning("No existing IDs provided, cannot determine missing documents")
+            return
+            
+        try:
+            # Convert to set for efficient lookup
+            existing_ids_set = set(existing_ids)
+            
+            # Get total document count
+            total_docs = await self.client.count(index=self.index_name)
+            count_value = total_docs.get("count", 0)
+            
+            logger.info(f"Total documents: {count_value}")
+            logger.info(f"Existing IDs: Length: {len(existing_ids_set)}")
+            logger.info(f"Missing IDs: Length: {count_value - len(existing_ids_set)}")
+            
+            # If there are no missing documents, return early
+            if count_value <= len(existing_ids_set):
+                logger.info("No missing documents found")
+                return
+            
+            # Query for documents that are NOT in the existing_ids_set
+            query = {
+                "query": {
+                    "bool": {
+                        "must_not": {
+                            "terms": {
+                                "id_edarehoquqy": list(existing_ids_set)
+                            }
+                        }
+                    }
+                }, 
+                "_source": ["id_edarehoquqy", "question", "answer", "content", "metadata", "title", "summary"],
+                "size": 1000  # Fetch in batches
+            }
+
+            # Get documents from elasticsearch using scroll API
+            resp = await self.client.search(
+                index=self.index_name,
+                body=query,
+                scroll="3m"
+            )
+            
+            scroll_id = resp.get("_scroll_id")
+            total_hits = resp["hits"]["total"]["value"]
+            logger.info(f"Found {total_hits} documents not in the existing IDs list")
+            
+            try:
+                # Process initial batch
+                for hit in resp["hits"]["hits"]:
+                    source = hit["_source"]
+                    # Ensure id_edarehoquqy exists
+                    if "id_edarehoquqy" not in source:
+                        source["id_edarehoquqy"] = hit.get("_id", "unknown_id")
+                    yield source
+                    
+                # Continue scrolling until all results are retrieved
+                while scroll_id and resp["hits"]["hits"]:
+                    resp = await self.client.scroll(
+                        scroll_id=scroll_id,
+                        scroll="3m"
+                    )
+                    scroll_id = resp.get("_scroll_id")
+                    
+                    for hit in resp["hits"]["hits"]:
+                        source = hit["_source"]
+                        # Ensure id_edarehoquqy exists
+                        if "id_edarehoquqy" not in source:
+                            source["id_edarehoquqy"] = hit.get("_id", "unknown_id")
+                        yield source
+            except Exception as e:
+                logger.error(f"Error processing search results: {e}")
+            finally:
+                # Clear scroll context if it exists
+                if scroll_id:
+                    try:
+                        await self.client.clear_scroll(scroll_id=scroll_id)
+                    except Exception as e:
+                        logger.warning(f"Failed to clear scroll: {e}")
+                        
+        except Exception as e:
+            logger.error(f"Error retrieving missing documents: {e}")
+            import traceback
+            logger.error(f"Traceback: {traceback.format_exc()}")
+    
+    async def get_document(self, doc_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Get a document by ID from Elasticsearch.
+        
+        Args:
+            doc_id: ID of the document to retrieve
+        
+        Returns:
+            Dict[str, Any]: Document data
+        """
+        try:
+            resp = await self.client.get(index=self.index_name, id=doc_id, source=["question", "answer", "content", "metadata", "id_edarehoquqy"])
+            return resp["_source"]
+        except Exception as e:
+            logger.error(f"Error getting document: {e}")
+            return None
+    
 
     async def close(self):
         """Close the Elasticsearch client connection."""

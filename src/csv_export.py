@@ -85,6 +85,9 @@ async def get_doc_title(client: AsyncOpenAI, doc: str) -> str:
     Returns:
         A string containing the generated title
     """
+    if not client:
+        raise ValueError("Client is not initialized")
+    
     prompt = f"""
     Generate a precise, searchable Persian title (10-12 words) for this Iranian legal document in Q&A format.
     
