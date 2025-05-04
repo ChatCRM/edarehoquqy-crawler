@@ -223,7 +223,7 @@ class Loader:
 
 
 class WordExporter:
-    def __init__(self, file_loader: Loader, output_dir: str = None):
+    def __init__(self, file_loader: Loader, output_dir: str = None, max_docs_per_file: int = 20):
         """
         Initialize a WordExporter to export documents to Word files.
         
@@ -231,9 +231,11 @@ class WordExporter:
             file_loader: FileLoader instance to load documents from
             output_dir: Optional output directory to save Word documents to.
                        If not provided, documents will be saved in the keyword directories.
+            max_docs_per_file: Maximum number of documents per Word file (default 999)
         """
         self.file_loader = file_loader
         self.output_dir = output_dir
+        self.max_docs_per_file = max_docs_per_file
     
     def _get_new_composer(self, doc: Document) -> Composer:
         return Composer(doc)
@@ -478,105 +480,205 @@ class WordExporter:
             doc.add_page_break()
             return doc
     
-    async def export_ara_keyword_docs(self, keyword: str) -> Optional[str]:
-        """Export all documents for a keyword to a single Word document"""
+    async def export_ara_keyword_docs(self, keyword: str) -> Optional[List[str]]:
+        """Export all documents for a keyword to Word documents, splitting into multiple files if needed
+        
+        Args:
+            keyword: The keyword to export documents for
+            
+        Returns:
+            List of paths to the saved Word documents if successful, None otherwise
+        """
         try:
-            # Create an empty document with styles
+            # Initialize variables
+            output_paths = []
+            doc_count = 0
+            file_index = 1
+            total_count = 0
+            
+            # Create first document
             master_doc = Document()
             self._setup_styles(master_doc)
             composer = Composer(master_doc)
-            
-            # Counter to track if we added any documents
-            doc_count = 0
             
             # Process each document for this keyword
             async for data in self.file_loader.get_documents_by_keyword(keyword, index_type="ara"):
-                doc = self._create_ara_document(data, doc_count + 1)
+                # Check if we need to start a new file
+                if doc_count >= self.max_docs_per_file:
+                    # Save the current file
+                    if self.output_dir:
+                        # Use specified output directory
+                        output_path = os.path.join(self.output_dir, f"{keyword}_{file_index}.docx")
+                    else:
+                        # Save in the keyword directory
+                        output_path = os.path.join(str(self.file_loader.root_dir), keyword, f"{keyword}_{file_index}.docx")  
+                    
+                    # Ensure directory exists
+                    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+                    
+                    # Save the document
+                    composer.save(output_path)
+                    output_paths.append(output_path)
+                    logger.info(f"Saved document part {file_index} for '{keyword}' with {doc_count} documents to {output_path}")
+                    
+                    # Start a new document
+                    master_doc = Document()
+                    self._setup_styles(master_doc)
+                    composer = Composer(master_doc)
+                    doc_count = 0
+                    file_index += 1
+                
+                # Add this document to the current file
+                doc = self._create_ara_document(data, total_count + 1)
                 composer.append(doc)
                 doc_count += 1
+                total_count += 1
             
-            # Determine the output path
-            if self.output_dir:
-                # Use specified output directory
-                output_path = os.path.join(self.output_dir, f"{keyword}.docx")
-            else:
-                # Save in the keyword directory
-                output_path = os.path.join(str(self.file_loader.root_dir), keyword, f"{keyword}.docx")  
+            # Save the final document if it contains any documents
+            if doc_count > 0:
+                # Determine file name based on whether we already created other files
+                file_suffix = f"_{file_index}" if file_index > 1 else ""
                 
-            # Ensure directory exists
-            os.makedirs(os.path.dirname(output_path), exist_ok=True)
+                if self.output_dir:
+                    # Use specified output directory
+                    output_path = os.path.join(self.output_dir, f"{keyword}{file_suffix}.docx")
+                else:
+                    # Save in the keyword directory
+                    output_path = os.path.join(str(self.file_loader.root_dir), keyword, f"{keyword}{file_suffix}.docx")  
+                    
+                # Ensure directory exists
+                os.makedirs(os.path.dirname(output_path), exist_ok=True)
+                
+                # Save the document
+                composer.save(output_path)
+                output_paths.append(output_path)
+                logger.info(f"Saved final document part for '{keyword}' with {doc_count} documents to {output_path}")
             
-            # Save the document
-            composer.save(output_path)
-            logger.info(f"Saved combined document for '{keyword}' with {doc_count} documents to {output_path}")
-
-            return output_path
+            if not output_paths:
+                logger.warning(f"No documents found for keyword: {keyword}")
+                return None
+                
+            logger.info(f"Successfully exported {total_count} documents for '{keyword}' across {len(output_paths)} files")
+            return output_paths
+            
         except Exception as e:
             logger.error(f"Error creating Word document for keyword '{keyword}': {e}")
+            import traceback
+            logger.error(f"Error details: {traceback.format_exc()}")
             return None
         
-    async def export_keyword_to_word(self, keyword: str) -> Optional[str]:
-        """Export all documents for a keyword to a single Word document"""
+    async def export_keyword_to_word(self, keyword: str) -> Optional[List[str]]:
+        """Export all documents for a keyword to Word documents, splitting into multiple files if needed
+        
+        Args:
+            keyword: The keyword to export documents for
+            
+        Returns:
+            List of paths to the saved Word documents if successful, None otherwise
+        """
         try:
-            # Create an empty document with styles
+            # Initialize variables
+            output_paths = []
+            doc_count = 0
+            file_index = 1
+            total_count = 0
+            
+            # Create first document
             master_doc = Document()
             self._setup_styles(master_doc)
             composer = Composer(master_doc)
             
-            # Counter to track if we added any documents
-            doc_count = 0 
-            
             # Process each document for this keyword
             async for data in self.file_loader.get_documents_by_keyword(keyword):
-                doc = self._create_document(data, doc_count + 1)
+                # Check if we need to start a new file
+                if doc_count >= self.max_docs_per_file:
+                    # Save the current file
+                    if self.output_dir:
+                        # Use specified output directory
+                        output_path = os.path.join(self.output_dir, f"{keyword}_{file_index}.docx")
+                    else:
+                        # Save in the keyword directory
+                        output_path = os.path.join(str(self.file_loader.root_dir), keyword, f"{keyword}_{file_index}.docx")
+                    
+                    # Ensure directory exists
+                    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+                    
+                    # Save the document
+                    composer.save(output_path)
+                    output_paths.append(output_path)
+                    logger.info(f"Saved document part {file_index} for '{keyword}' with {doc_count} documents to {output_path}")
+                    
+                    # Start a new document
+                    master_doc = Document()
+                    self._setup_styles(master_doc)
+                    composer = Composer(master_doc)
+                    doc_count = 0
+                    file_index += 1
+                
+                # Add this document to the current file
+                doc = self._create_document(data, total_count + 1)
                 composer.append(doc)
                 doc_count += 1
+                total_count += 1
             
-            # Skip empty documents
-            if doc_count == 0:
+            # Skip if no documents were found
+            if total_count == 0:
                 logger.warning(f"No documents found for keyword: {keyword}")
                 return None
                 
-            # Determine the output path
-            if self.output_dir:
-                # Use specified output directory
-                output_path = os.path.join(self.output_dir, f"{keyword}.docx")
-            else:
-                # Save in the keyword directory
-                output_path = os.path.join(str(self.file_loader.root_dir), keyword, f"{keyword}.docx")
+            # Save the final document if it contains any documents
+            if doc_count > 0:
+                # Determine file name based on whether we already created other files
+                file_suffix = f"_{file_index}" if file_index > 1 else ""
                 
-            # Ensure directory exists
-            os.makedirs(os.path.dirname(output_path), exist_ok=True)
+                if self.output_dir:
+                    # Use specified output directory
+                    output_path = os.path.join(self.output_dir, f"{keyword}{file_suffix}.docx")
+                else:
+                    # Save in the keyword directory
+                    output_path = os.path.join(str(self.file_loader.root_dir), keyword, f"{keyword}{file_suffix}.docx")
+                    
+                # Ensure directory exists
+                os.makedirs(os.path.dirname(output_path), exist_ok=True)
+                
+                # Save the document
+                composer.save(output_path)
+                output_paths.append(output_path)
+                logger.info(f"Saved final document part for '{keyword}' with {doc_count} documents to {output_path}")
             
-            # Save the document
-            composer.save(output_path)
-            logger.info(f"Saved combined document for '{keyword}' with {doc_count} documents to {output_path}")
+            logger.info(f"Successfully exported {total_count} documents for '{keyword}' across {len(output_paths)} files")
+            return output_paths
             
-            return output_path
         except Exception as e:
             logger.error(f"Error creating Word document for keyword '{keyword}': {e}")
+            import traceback
+            logger.error(f"Error details: {traceback.format_exc()}")
             return None
 
-    async def export_uncategorized_documents(self, index_type: str = "edarehoquqy") -> Optional[str]:
+    async def export_uncategorized_documents(self, index_type: str = "edarehoquqy") -> Optional[List[str]]:
         """
-        Export all uncategorized documents to a single Word document and also create HTML files
+        Export all uncategorized documents to Word documents, splitting into multiple files if needed,
+        and also create HTML files
         
         Args:
             index_type: Type of index to process ('edarehoquqy' or 'ara')
             
         Returns:
-            Path to the saved Word document if successful, None otherwise
+            List of paths to the saved Word documents if successful, None otherwise
         """
         try:
             logger.info(f"Exporting uncategorized documents for index type: {index_type}")
             
-            # Create an empty document with styles
+            # Initialize variables
+            output_paths = []
+            doc_count = 0
+            file_index = 1
+            total_count = 0
+            
+            # Create first document
             master_doc = Document()
             self._setup_styles(master_doc)
             composer = Composer(master_doc)
-            
-            # Counter to track if we added any documents
-            doc_count = 0
             
             # The uncategorized keyword
             uncategorized_keyword = "بدون-دسته-بندی"
@@ -584,31 +686,49 @@ class WordExporter:
             # Make the directory for JSON/HTML files
             uncategorized_dir = os.path.join(str(self.file_loader.root_dir), uncategorized_keyword)
             os.makedirs(uncategorized_dir, exist_ok=True)
-        
-            # Determine the output path for Word document
-            if self.output_dir:
-                # Use specified output directory
-                output_path = os.path.join(self.output_dir, f"{uncategorized_keyword}.docx")
-            else:
-                # Save in the uncategorized directory
-                output_path = os.path.join(uncategorized_dir, f"{uncategorized_keyword}.docx")
             
             # Process each uncategorized document
             async for data in self.file_loader.get_uncategorized_documents(index_type):
                 try:
+                    # Check if we need to start a new file
+                    if doc_count >= self.max_docs_per_file:
+                        # Save the current file
+                        if self.output_dir:
+                            # Use specified output directory
+                            output_path = os.path.join(self.output_dir, f"{uncategorized_keyword}_{file_index}.docx")
+                        else:
+                            # Save in the uncategorized directory
+                            output_path = os.path.join(uncategorized_dir, f"{uncategorized_keyword}_{file_index}.docx")
+                        
+                        # Ensure directory exists
+                        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+                        
+                        # Save the document
+                        composer.save(output_path)
+                        output_paths.append(output_path)
+                        logger.info(f"Saved document part {file_index} for uncategorized with {doc_count} documents to {output_path}")
+                        
+                        # Start a new document
+                        master_doc = Document()
+                        self._setup_styles(master_doc)
+                        composer = Composer(master_doc)
+                        doc_count = 0
+                        file_index += 1
+                    
                     # Determine document type based on attributes
                     is_ara_document = hasattr(data, 'id_ara') and not hasattr(data, 'id_edarehoquqy')
                     
                     # Add to Word document using appropriate method
                     if index_type == "ara" or is_ara_document:
-                        doc = self._create_ara_document(data, doc_count + 1)
+                        doc = self._create_ara_document(data, total_count + 1)
                         doc_id = data.id_ara
                     else:
-                        doc = self._create_document(data, doc_count + 1)
+                        doc = self._create_document(data, total_count + 1)
                         doc_id = data.id_edarehoquqy
                     
                     composer.append(doc)
                     doc_count += 1
+                    total_count += 1
                     
                     # Create directory for this document's files
                     doc_dir = AsyncPath(uncategorized_dir) / doc_id
@@ -631,39 +751,49 @@ class WordExporter:
                     logger.error(f"Error details: {traceback.format_exc()}")
                     continue
             
-            # Skip empty documents
-            if doc_count == 0:
+            # Skip if no documents were found
+            if total_count == 0:
                 logger.info("No uncategorized documents found")
                 return None
-                
-            # Ensure directory exists for the Word file
-            os.makedirs(os.path.dirname(output_path), exist_ok=True)
             
-            # Save the document
-            try:
+            # Save the final document if it contains any documents
+            if doc_count > 0:
+                # Determine file name based on whether we already created other files
+                file_suffix = f"_{file_index}" if file_index > 1 else ""
+                
+                if self.output_dir:
+                    # Use specified output directory
+                    output_path = os.path.join(self.output_dir, f"{uncategorized_keyword}{file_suffix}.docx")
+                else:
+                    # Save in the uncategorized directory
+                    output_path = os.path.join(uncategorized_dir, f"{uncategorized_keyword}{file_suffix}.docx")
+                    
+                # Ensure directory exists
+                os.makedirs(os.path.dirname(output_path), exist_ok=True)
+                
+                # Save the document
                 composer.save(output_path)
-                logger.info(f"Saved combined document for uncategorized documents with {doc_count} documents to {output_path}")
-                return output_path
-            except Exception as e:
-                logger.error(f"Error saving uncategorized documents to {output_path}: {e}")
-                import traceback
-                logger.error(f"Save error details: {traceback.format_exc()}")
-                return None
+                output_paths.append(output_path)
+                logger.info(f"Saved final document part for uncategorized with {doc_count} documents to {output_path}")
+            
+            logger.info(f"Successfully exported {total_count} uncategorized documents across {len(output_paths)} files")
+            return output_paths
+                
         except Exception as e:
             logger.error(f"Error creating Word document for uncategorized documents: {e}")
             import traceback
             logger.error(f"Error details: {traceback.format_exc()}")
             return None
     
-    async def export_all_keywords(self, limit: int = None, index_type: str = "edarehoquqy") -> Dict[str, str]:
-        """Export all keywords to separate Word documents
+    async def export_all_keywords(self, limit: int = None, index_type: str = "edarehoquqy") -> Dict[str, List[str]]:
+        """Export all keywords to separate Word documents, splitting into multiple files if needed
         
         Args:
             limit: Optional limit on the number of keywords to process
             index_type: Type of index to process ('edarehoquqy' or 'ara')
             
         Returns:
-            Dictionary mapping keywords to saved Word document paths
+            Dictionary mapping keywords to lists of saved Word document paths
         """
         results = {}
         logger.info(f"Starting export of keywords with index type: {index_type}")
@@ -682,13 +812,13 @@ class WordExporter:
             for i, keyword in enumerate(keywords):
                 logger.info(f"Processing keyword {i+1}/{len(keywords)}: '{keyword}'")
                 if index_type == "ara":
-                    output_path = await self.export_ara_keyword_docs(keyword)
+                    output_paths = await self.export_ara_keyword_docs(keyword)
                 else:
-                    output_path = await self.export_keyword_to_word(keyword)
+                    output_paths = await self.export_keyword_to_word(keyword)
                 
-                if output_path:
-                    logger.info(f"Successfully exported keyword '{keyword}' to {output_path}")
-                    results[keyword] = output_path
+                if output_paths:
+                    logger.info(f"Successfully exported keyword '{keyword}' to {len(output_paths)} files")
+                    results[keyword] = output_paths
                 else:
                     logger.warning(f"Failed to export keyword '{keyword}'")
             
@@ -736,16 +866,16 @@ async def main():
         # Log results
         # if results:
         #     logger.info(f"Successfully exported {len(results)} keywords to Word documents:")
-        #     for keyword, path in results.items():
-        #         logger.info(f"  - {keyword}: {path}")
+        #     for keyword, paths in results.items():
+        #         logger.info(f"  - {keyword}: {paths}")
         # else:
         #     logger.warning("No documents were exported")
         
         # Now handle uncategorized documents
         logger.info("Now processing uncategorized documents...")
-        uncategorized_path = await exporter.export_uncategorized_documents()
-        if uncategorized_path:
-            logger.info(f"Successfully exported uncategorized documents to: {uncategorized_path}")
+        uncategorized_paths = await exporter.export_uncategorized_documents()
+        if uncategorized_paths:
+            logger.info(f"Successfully exported uncategorized documents to: {uncategorized_paths}")
         else:
             logger.info("No uncategorized documents found")
             

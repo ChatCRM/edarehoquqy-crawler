@@ -90,7 +90,14 @@ class AraDocument(BaseModel):
         Return a properly formatted metadata object for WordExporter.
         """
         if not self.metadata:
-            return {}
+            # Create default metadata with required fields for EdarehoquqyDocument compatibility
+            return Metadata(
+                file_id=self.id_ara,
+                file_number="نامشخص",  # Add default file_number
+                opinion_date={"shamsi": self.date.shamsi if self.date else "0001/01/01", 
+                              "gregorian": self.date.gregorian if self.date else "0001/01/01"},
+                opinion_number="نامشخص"  # Add default opinion_number
+            )
             
         try:
             # Use pydantic's model_dump or dict method to convert to dictionary
@@ -103,17 +110,40 @@ class AraDocument(BaseModel):
             # Add file_id for compatibility
             meta_dict["file_id"] = self.id_ara
             
+            # Add these fields for EdarehoquqyDocument compatibility
+            meta_dict["file_number"] = meta_dict.get("file_number", "نامشخص")
+            meta_dict["opinion_number"] = meta_dict.get("opinion_number", "نامشخص")
+            
+            # Create opinion_date if missing
+            if "opinion_date" not in meta_dict:
+                meta_dict["opinion_date"] = {
+                    "shamsi": self.date.shamsi if self.date else "0001/01/01",
+                    "gregorian": self.date.gregorian if self.date else "0001/01/01"
+                }
+            
             # Ensure selected_document_judgment is a string if needed
             if "selected_document_judgment" in meta_dict:
                 if meta_dict["selected_document_judgment"] is None:
                     meta_dict["selected_document_judgment"] = ""
                 elif not isinstance(meta_dict["selected_document_judgment"], str):
                     meta_dict["selected_document_judgment"] = str(meta_dict["selected_document_judgment"])
-                
-            return meta_dict
+            
+            # Return a Metadata object for compatibility
+            return Metadata(**{
+                "file_id": meta_dict.get("file_id", self.id_ara),
+                "file_number": meta_dict.get("file_number", "نامشخص"),
+                "opinion_date": meta_dict.get("opinion_date", {"shamsi": "0001/01/01", "gregorian": "0001/01/01"}),
+                "opinion_number": meta_dict.get("opinion_number", "نامشخص")
+            })
         except Exception as e:
-            logger.warning(f"Error creating metadata dictionary: {e}")
-            return {}
+            logger.warning(f"Error creating metadata dictionary for document {self.id_ara}: {e}")
+            # Return a minimal valid Metadata object
+            return Metadata(
+                file_id=self.id_ara,
+                file_number="نامشخص",
+                opinion_date={"shamsi": "0001/01/01", "gregorian": "0001/01/01"},
+                opinion_number="نامشخص"
+            )
     
     def model_dump(self) -> Dict[str, Any]:
         return self.dict()

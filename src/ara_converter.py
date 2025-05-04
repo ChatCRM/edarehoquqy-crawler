@@ -16,8 +16,7 @@ import traceback
 import base64
 
 from src.csv_export import AraMetadata, AraDate, AraDocument, EdarehoquqyDocument, get_each_doc_summary, get_doc_title
-from src.html_export import document_to_html, save_html_file
-from src.html_converter import get_all_existing_ids, QUERY_LIST_V1
+from src.html_converter import get_query_keywords, get_all_existing_ids, QUERY_LIST_V1
 from src.elasticsearch_service import ElasticsearchService
 from src.word_export import WordExporter, Loader
 
@@ -41,7 +40,7 @@ class AraLoader(Loader):
         """
         super().__init__(root_dir, elasticsearch_service, openai_client)
 
-    async def load_json_file(self, dir_path: AsyncPath) -> Optional[AraDocument]:
+    async def load_json_file(self, dir_path: AsyncPath) -> AsyncGenerator[Optional[AraDocument], None]:
         """Load a JSON file from an ID directory and convert it to AraDocument"""
         try:
             json_files = []
@@ -50,34 +49,45 @@ class AraLoader(Loader):
                 
             if not json_files:
                 logger.warning(f"No JSON files found in {dir_path}")
-                return None
+                return
                 
-            # Use the first JSON file found
-            json_file = json_files[0]
-            async with aiofiles.open(json_file, mode='r', encoding='utf-8') as f:
-                data = await f.read()
-                json_data = json.loads(data)
-                return convert_to_ara_document(json_data)
-        except json.JSONDecodeError:
-            logger.error(f"Failed to decode JSON from {dir_path}")
-            self._failed_files.add(str(dir_path))
-            return None
+            for json_file in json_files:
+                # Use the first JSON file found
+                try:
+                    async with aiofiles.open(json_file, mode='r', encoding='utf-8') as f:
+                        data = await f.read()
+                        json_data = json.loads(data)
+                        yield convert_to_ara_document(json_data)
+                except json.JSONDecodeError:
+                    logger.error(f"Failed to decode JSON from {json_file}")
+                    self._failed_files.add(str(json_file))
+                except Exception as e:
+                    logger.error(f"Error loading file {json_file}: {e}")
+                    self._failed_files.add(str(json_file))
         except Exception as e:
-            logger.error(f"Error loading file from {dir_path}: {e}")
+            logger.error(f"Error accessing directory {dir_path}: {e}")
             self._failed_files.add(str(dir_path))
-            return None
             
     async def get_documents_by_keyword(self, keyword: str, index_type: str = "ara") -> AsyncGenerator[AraDocument, None]:
         """Get all documents for a specific keyword"""
         id_dirs = await self.get_id_dirs(keyword)
+        logger.info(f"Found {len(id_dirs)} ID directories for keyword '{keyword}'")
+        doc_count = 0
+        
         for dir_path in id_dirs:
-            document = await self.load_json_file(dir_path)
-            if document:
-                # Add to categorized IDs set
-                self._categorized_ids.add(document.id_ara)
+            async for document in self.load_json_file(dir_path):
+                if document:
+                    # Add to categorized IDs set
+                    self._categorized_ids.add(document.id_ara)
+                    doc_count += 1
+                    if doc_count % 10 == 0:
+                        logger.info(f"Processed {doc_count} documents so far for keyword '{keyword}'")
                 yield document
             else:
+                logger.warning(f"Failed to load document from directory: {dir_path}")
                 self._failed_ids.add(dir_path.name)
+        
+        logger.info(f"Total documents found for keyword '{keyword}': {doc_count}")
 
     async def get_uncategorized_documents(self, index_type: str = "ara") -> AsyncGenerator[AraDocument, None]:
         """
@@ -146,15 +156,15 @@ class AraLoader(Loader):
                             "shamsi": document.date.shamsi if document.date and document.date.shamsi else "0001/01/01"
                         } if document.date else {"georgian": "0001/01/01", "gregorian": "0001/01/01", "shamsi": "0001/01/01"},
                         "metadata": {
-                            "authority_type": document.metadata.authority_type,
-                            "branch": document.metadata.branch,
-                            "final_judgment": document.metadata.final_judgment,
-                            "judge": document.metadata.judge,
-                            "judgment_group": document.metadata.judgment_group,
-                            "judgment_type": document.metadata.judgment_type,
-                            "petition_date": document.metadata.petition_date,
-                            "selected_document_judgment": document.metadata.selected_document_judgment,
-                            "session_number": document.metadata.session_number
+                            "authority_type": document.metadata.authority_type if document.metadata else None,
+                            "branch": document.metadata.branch if document.metadata else None,
+                            "final_judgment": document.metadata.final_judgment if document.metadata else None,
+                            "judge": document.metadata.judge if document.metadata else None,
+                            "judgment_group": document.metadata.judgment_group if document.metadata else None,
+                            "judgment_type": document.metadata.judgment_type if document.metadata else None,
+                            "petition_date": document.metadata.petition_date if document.metadata else None,
+                            "selected_document_judgment": document.metadata.selected_document_judgment if document.metadata else None,
+                            "session_number": document.metadata.session_number if document.metadata else None
                         } if document.metadata else None
                     }
                     
@@ -172,7 +182,7 @@ class AraLoader(Loader):
                         logger.error(f"Error saving HTML file for uncategorized document {document.id_ara}: {e}")
                     
                     processed_count += 1
-                    if processed_count % 100 == 0:
+                    if processed_count % 10 == 0:
                         logger.info(f"Processed {processed_count} uncategorized documents so far")
                     
                     yield document
@@ -246,76 +256,6 @@ def convert_to_ara_document(doc_data: Dict[str, Any]) -> AraDocument:
         # Create a minimal valid document
         return AraDocument(id_ara=doc_data.get("id_ara", "unknown_id"))
 
-
-async def get_query_keywords(client: AsyncOpenAI, query: str, max_keywords: int = 15) -> List[str]:
-    """
-    Generate up to a maximum number of relevant search keywords for an Iranian legal query.
-    Similar to html_converter function but adapted for ARA index.
-    
-    Args:
-        client: AsyncOpenAI client
-        query: The main legal query or topic (in Persian or English)
-        max_keywords: Maximum number of keywords to generate (default: 15)
-        
-    Returns:
-        List of relevant search keywords (maximum of max_keywords)
-    """
-    # Similar prompt as in html_converter but adapted for ARA content
-    prompt = f"""
-    تولید کلمات کلیدی برای جستجوی حقوقی و قضایی ایرانی در زمینه احکام شرعی: "{query}"
-
-    هدف: ایجاد حداکثر {max_keywords} کلمه کلیدی برای جستجوی مؤثر در پایگاه داده احکام و فتاوی ایران در مورد موضوع "{query}".
-
-    دستورالعمل‌ها:
-    1. اصطلاحات رسمی حقوقی و فقهی مرتبط با موضوع را در قوانین و احکام ایران شناسایی کنید
-    2. شامل اصطلاحات متداول و روزمره که افراد غیر حقوقی ممکن است استفاده کنند
-    3. مواد قانونی مرتبط، شماره‌های آیات و روایات و ارجاعات خاص را در نظر بگیرید
-    4. اصطلاحات مربوط به احکام شرعی و قضایی مرتبط را شامل کنید
-    5. از منظر استفتاء کننده و مفتی به موضوع نگاه کنید
-    6. مترادف‌ها و واریاسیون‌های اصطلاحات کلیدی را شامل کنید
-    7. اصطلاحات مربوط به احکام، نتایج و راه‌حل‌های شرعی را در نظر بگیرید
-    8. عبارات ترکیبی که احتمالاً در متن قوانین یا فتاوی وجود دارند
-    9. از کلمات کلیدی مرتبط با احکام و فتاوی فعلی مراجع ایران استفاده کنید
-    10. ترکیبی از کلمات تک و عبارات کوتاه را در نظر بگیرید
-
-    فقط لیستی از کلمات کلیدی به زبان فارسی (حداکثر {max_keywords} مورد) را برگردانید.
-    """
-    
-    logger.info(f"Generating keywords for query: {query}")
-    try:
-        response = await client.chat.completions.create(
-            model="gpt-4.1-mini", 
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=2000,
-            temperature=0.1,
-            response_format={"type": "json_object"}
-        )
-        
-        content = response.choices[0].message.content
-        parsed_content = json.loads(content)
-        
-        # Extract keywords from the parsed content
-        if "keywords" in parsed_content:
-            keywords = parsed_content["keywords"]
-        else:
-            # If the model didn't use the proper format, try to extract a list
-            content_str = str(parsed_content)
-            import re
-            keywords = re.findall(r'["\'](.*?)["\']', content_str)
-        
-        # Ensure the original query is the first item
-        results = [query]
-        if len(keywords) > max_keywords:
-            results.extend(keywords[:max_keywords])
-        else:
-            results.extend(keywords)
-        return results
-    except Exception as e:
-        logger.error(f"Error generating keywords for '{query}': {e}")
-        # Fallback to basic keywords if there's an error
-        if isinstance(query, str) and query.strip():
-            return [query]
-        return []
 
 async def get_data_from_ara(query_list: List[str], client: AsyncOpenAI, output_dir: str = "../ara-output") -> AsyncGenerator[Tuple[AraDocument, str], None]:
     """
@@ -578,7 +518,7 @@ async def create_ara_html(doc: AraDocument, font_path: Optional[Path] = None) ->
         {font_face}
         body {{
             font-family: 'IranSans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, 'Open Sans', 'Helvetica Neue', sans-serif;
-            line-height: a1.8;
+            line-height: 1.8;
             color: #333;
             max-width: 800px;
             margin: 0 auto;
@@ -648,9 +588,7 @@ async def create_ara_html(doc: AraDocument, font_path: Optional[Path] = None) ->
         .title-section {{
             font-weight: 600;
             margin-top: 2rem;
-            background-color: #f1f8ff;
             padding: 1rem;
-            border-right: 4px solid #4a6fa5;
             border-radius: 4px;
         }}
         .message-section {{
@@ -681,6 +619,23 @@ async def create_ara_html(doc: AraDocument, font_path: Optional[Path] = None) ->
             margin: 0.80rem 0;
             text-align: justify;
         }}
+        .section-content {{
+            padding: 0.5rem 1rem;
+            margin-bottom: 1.5rem;
+            background-color: #fff;
+            border: 1px solid #eaeaea;
+            border-radius: 4px;
+        }}
+        .section-heading {{
+            font-size: 1.3em;
+            font-weight: 600;
+            color: #2c3e50;
+            background-color: #f1f8ff;
+            padding: 0.7rem 1rem;
+            border-right: 4px solid #4a6fa5;
+            border-radius: 4px;
+            margin: 1.5rem 0 0.5rem 0;
+        }}
         @media print {{
             body {{
                 padding: 1cm;
@@ -688,11 +643,11 @@ async def create_ara_html(doc: AraDocument, font_path: Optional[Path] = None) ->
                 color: black;
                 max-width: none;
             }}
-            .metadata, .summary, .title-section, .message-section, .content-section {{
+            .metadata, .summary, .title-section, .message-section, .content-section, .section-content {{
                 border: 1px solid #ddd;
                 page-break-inside: avoid;
             }}
-            h1, h2, h3 {{
+            h1, h2, h3, .section-heading {{
                 page-break-after: avoid;
                 font-size: 4rem;
                 margin: 2rem 0;
@@ -723,6 +678,16 @@ async def create_ara_html(doc: AraDocument, font_path: Optional[Path] = None) ->
     if doc.metadata and doc.metadata.judgment_group and doc.metadata.judgment_group != "نامشخص":
         metadata_html += f"<p><strong>گروه حکم:</strong> {doc.metadata.judgment_group}</p>"
     
+    # Add selected document judgment if available, handling both array and string values
+    if doc.metadata and doc.metadata.selected_document_judgment:
+        if isinstance(doc.metadata.selected_document_judgment, list) and doc.metadata.selected_document_judgment:
+            # Join array items with commas
+            judgments = " , ".join(doc.metadata.selected_document_judgment)
+            metadata_html += f"<p><strong>مراجع قضایی:</strong> {judgments}</p>"
+        elif isinstance(doc.metadata.selected_document_judgment, str) and doc.metadata.selected_document_judgment.strip():
+            # Single string value
+            metadata_html += f"<p><strong>مراجع قضایی:</strong> {doc.metadata.selected_document_judgment}</p>"
+    
     # Add branch if available
     if doc.metadata and doc.metadata.branch and doc.metadata.branch.strip():
         metadata_html += f"<p><strong>شعبه:</strong> {doc.metadata.branch}</p>"
@@ -744,15 +709,45 @@ async def create_ara_html(doc: AraDocument, font_path: Optional[Path] = None) ->
     
     metadata_html += "</div>"
     
-    # Generate title section if available
-    title_html = ""
-    if doc.title:
-        title_html = f"""
-        <div class="title-section">
-            <h2>عنوان</h2>
-            <p>{doc.title}</p>
+    # Generate summary section if available
+    summary_html = ""
+    if doc.summary:
+        summary_html = f"""
+        <div class="summary">
+            <h3>خلاصه</h3>
+            <p>{doc.summary}</p>
         </div>
         """
+    
+    # Process content with ## separators
+    content_html = ""
+    if doc.content:
+        # Split content by ##
+        sections = doc.content.split("##")
+        
+        if len(sections) > 1:
+            # The first section might be empty if the content starts with ##
+            if sections[0].strip():
+                content_html += f'<div class="section-content"><p>{sections[0].strip()}</p></div>'
+            
+            # Process each section after the first
+            for i in range(1, len(sections)):
+                section = sections[i].strip()
+                if not section:
+                    continue
+                
+                # Extract the heading (first line) and content
+                lines = section.split('\n', 1)
+                heading = lines[0].strip()
+                
+                content_html += f'<div class="section-heading">{heading}</div>'
+                
+                if len(lines) > 1:
+                    section_content = lines[1].strip()
+                    content_html += f'<div class="section-content"><p>{section_content}</p></div>'
+        else:
+            # No ## found, treat as regular content
+            content_html = f'<div class="section-content"><p>{doc.content}</p></div>'
     
     # Generate message section if available
     message_html = ""
@@ -764,30 +759,15 @@ async def create_ara_html(doc: AraDocument, font_path: Optional[Path] = None) ->
         </div>
         """
     
-    # Generate content section if available
-    content_html = ""
-    if doc.content:
-        content_html = f"""
-        <div class="content-section">
-            <h2>محتوا</h2>
-            <p>{doc.content}</p>
-        </div>
-        """
-    
-    # Generate summary section if available
-    summary_html = ""
-    if doc.summary:
-        summary_html = f"""
-        <div class="summary">
-            <h3>خلاصه</h3>
-            <p>{doc.summary}</p>
-        </div>
-        """
-    
     # Use title or ID for the page title
     page_title = doc.title if doc.title else f"سند {doc.id_ara}"
     
-    # Assemble the complete HTML document
+    # Title should be at the top
+    title_html = f"""
+    <h1>{page_title}</h1>
+    """
+    
+    # Assemble the complete HTML document with title at the top
     html_content = f"""<!DOCTYPE html>
 <html lang="fa" dir="rtl">
 <head>
@@ -797,12 +777,13 @@ async def create_ara_html(doc: AraDocument, font_path: Optional[Path] = None) ->
     {styles}
 </head>
 <body>
-    <h1>{page_title}</h1>
+    {title_html}
     {metadata_html}
     {summary_html}
-    {title_html}
+    <div class="content-section">
+        {content_html}
+    </div>
     {message_html}
-    {content_html}
     <hr>
     <footer>
         <p><em>شناسه سند: {doc.id_ara}</em></p>
@@ -949,23 +930,14 @@ async def process_ara_index(query_list: List[str], output_base_dir: str = None, 
             # Create WordExporter
             exporter = WordExporter(loader, word_output_dir)
             
-            # Export categorized documents
-            logger.info("Exporting categorized documents")
-            results = await exporter.export_all_keywords(limit=limit, index_type="ara")
-            
-            if results:
-                logger.info(f"Successfully exported {len(results)} categories to Word documents:")
-                for keyword, path in results.items():
-                    logger.info(f"  - {keyword}: {path}")
-            else:
-                logger.warning("No categorized documents were exported")
-            
             # Export uncategorized documents
             logger.info("Exporting uncategorized documents")
-            uncategorized_path = await exporter.export_uncategorized_documents(index_type="ara")
+            uncategorized_paths = await exporter.export_uncategorized_documents(index_type="ara")
             
-            if uncategorized_path:
-                logger.info(f"Successfully exported uncategorized documents to: {uncategorized_path}")
+            if uncategorized_paths:
+                logger.info(f"Successfully exported uncategorized documents to {len(uncategorized_paths)} file(s):")
+                for i, path in enumerate(uncategorized_paths):
+                    logger.info(f"  - Part {i+1}: {path}")
             else:
                 logger.info("No uncategorized documents found")
             
@@ -991,7 +963,7 @@ async def main():
     parser.add_argument("-q", "--queries", nargs="*", default=None, 
                         help="Search queries to retrieve documents from ARA index")
     parser.add_argument("-o", "--output-dir", help="Base output directory (default: ./)",
-                       default="./")
+                       default="../")
     parser.add_argument("--clear-existing", action="store_true", help="Clear existing output directories before processing")
     
     args = parser.parse_args()
