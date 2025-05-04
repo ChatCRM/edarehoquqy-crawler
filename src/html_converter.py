@@ -283,7 +283,7 @@ async def get_query_keywords(client: AsyncOpenAI, query: str, max_keywords: int 
     logger.info(f"Generating keywords for query: {query}")
     try:
         response = await client.beta.chat.completions.parse(
-            model="gpt-4.1-mini-2025-04-14", 
+            model="gpt-4.1-mini", 
             response_format=QueryKeywords,
             messages=[{"role": "user", "content": prompt}],
             max_tokens=2000,

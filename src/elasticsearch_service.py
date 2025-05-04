@@ -372,9 +372,18 @@ class ElasticsearchService:
         self,
         raw_query: str,
         use_semantic: bool = False,
+        index_name: str = None,
     ) -> Dict[str, Any]:
         """
         Build a simple but effective query to find relevant documents.
+        
+        Args:
+            raw_query: The search query (string or list of strings)
+            use_semantic: Whether to use semantic search
+            index_name: The index name to determine source fields
+            
+        Returns:
+            Dict with the query
         """
         # For string inputs, treat entire string as a single phrase
         phrases = [raw_query]
@@ -397,18 +406,33 @@ class ElasticsearchService:
                     "should": [],
                     "minimum_should_match": 1
                 }
-            },
-            "_source": ["question", "answer", "content", "metadata", "id_ghavanin", "id_edarehoquqy"]
+            }
         }
+        
+        # Determine source fields based on index name
+        index_name = index_name or self.index_name
+        if index_name == "ara":
+            query["_source"] = ["id_ara", "title", "content", "message", "documents", "metadata", "date"]
+        else:  # Default for edarehoquqy and other indices
+            query["_source"] = ["question", "answer", "content", "metadata", "id_ghavanin", "id_edarehoquqy"]
         
         # Add phrase matches for each field
         for phrase in phrases:
-            # Add match_phrase queries for exact matches with boosting
-            query["query"]["bool"]["should"].extend([
-                {"match_phrase": {"question": {"query": phrase, "boost": 5}}},
-                {"match_phrase": {"answer": {"query": phrase, "boost": 3}}},
-                {"match_phrase": {"content": {"query": phrase, "boost": 2}}}
-            ])
+            if index_name == "ara":
+                # Add match_phrase queries for ARA index with field-specific boosts
+                query["query"]["bool"]["should"].extend([
+                    {"match_phrase": {"title": {"query": phrase, "boost": 5}}},
+                    {"match_phrase": {"content": {"query": phrase, "boost": 3}}},
+                    {"match_phrase": {"message": {"query": phrase, "boost": 2}}},
+                    {"match_phrase": {"documents": {"query": phrase, "boost": 1}}}
+                ])
+            else:
+                # Add match_phrase queries for other indices with field-specific boosts
+                query["query"]["bool"]["should"].extend([
+                    {"match_phrase": {"question": {"query": phrase, "boost": 5}}},
+                    {"match_phrase": {"answer": {"query": phrase, "boost": 3}}},
+                    {"match_phrase": {"content": {"query": phrase, "boost": 2}}}
+                ])
         
         return query
 
@@ -417,16 +441,30 @@ class ElasticsearchService:
         raw_query: str,
         max_results: Optional[int] = None,
         use_semantic: bool = False,
-        min_score: float = 1.0
+        min_score: float = 1.0,
+        index_name: str = None
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """
         Search for documents matching the query and return results in batches.
+        
+        Args:
+            raw_query: The search query
+            max_results: Maximum number of results to return
+            use_semantic: Whether to use semantic search
+            min_score: Minimum score threshold
+            index_name: Index name to search (defaults to self.index_name)
+            
+        Yields:
+            Dict with search results
         """
         scroll_id = None
         
         try:
+            # Determine which index to use
+            index_to_search = index_name or self.index_name
+            
             # Build the search query
-            search_query = self.get_keyword_query(raw_query, use_semantic=use_semantic)
+            search_query = self.get_keyword_query(raw_query, use_semantic=use_semantic, index_name=index_to_search)
             search_query["size"] = 100
             search_query["track_total_hits"] = True
             search_query["sort"] = [{"_score": {"order": "desc"}}]
@@ -437,7 +475,7 @@ class ElasticsearchService:
             
             # Execute search
             resp = await self.client.search(
-                index=self.index_name,
+                index=index_to_search,
                 body=search_query,
                 scroll="1m",
                 timeout="120s"
@@ -471,8 +509,22 @@ class ElasticsearchService:
                     source = hit["_source"]
                     score = hit["_score"]
                     
-                    # Get document ID
-                    doc_id = source.get("id_edarehoquqy") or source.get("id_ghavanin") or hit["_id"]
+                    # Add _id to source for identification
+                    if "_id" in hit and "_id" not in source:
+                        source["_id"] = hit["_id"]
+                    
+                    # Get document ID based on index
+                    if index_to_search == "ara":
+                        doc_id = source.get("id_ara")
+                        # If id_ara is missing, log a warning but continue
+                        if not doc_id:
+                            logger.warning(f"Document missing id_ara field: {source.keys()}")
+                            continue
+                    else:
+                        doc_id = source.get("id_edarehoquqy") or source.get("id_ghavanin")
+                        if not doc_id:
+                            logger.warning(f"Document missing id_edarehoquqy or id_ghavanin field: {source.keys()}")
+                            continue
                     
                     # Skip duplicate documents
                     if doc_id in seen_ids:
@@ -490,7 +542,8 @@ class ElasticsearchService:
                     yield {
                         "total_count": total_hits,
                         "relevant_count": relevant_count,
-                        "results": batch
+                        "results": batch,
+                        "precision": relevant_count / processed if processed > 0 else 0
                     }
                 
                 # Break if we've reached max results or no more hits
@@ -520,12 +573,13 @@ class ElasticsearchService:
                 except Exception as e:
                     logger.warning(f"Failed to clear scroll: {e}")
     
-    async def get_missing_documents(self, existing_ids: List[str]) -> AsyncGenerator[Dict[str, Any], None]:
+    async def get_missing_documents(self, existing_ids: List[str], index_name: str = None) -> AsyncGenerator[Dict[str, Any], None]:
         """
         Get documents that are not present in Elasticsearch.
         
         Args:
             existing_ids: List of document IDs that are already indexed
+            index_name: Index name to search (defaults to self.index_name)
             
         Returns:
             AsyncGenerator[Dict[str, Any], None]: Generator yielding documents missing from Elasticsearch
@@ -535,14 +589,17 @@ class ElasticsearchService:
             return
             
         try:
+            # Determine which index to use
+            index_to_search = index_name or self.index_name
+            
             # Convert to set for efficient lookup
             existing_ids_set = set(existing_ids)
             
             # Get total document count
-            total_docs = await self.client.count(index=self.index_name)
+            total_docs = await self.client.count(index=index_to_search)
             count_value = total_docs.get("count", 0)
             
-            logger.info(f"Total documents: {count_value}")
+            logger.info(f"Total documents in {index_to_search}: {count_value}")
             logger.info(f"Existing IDs: Length: {len(existing_ids_set)}")
             logger.info(f"Missing IDs: Length: {count_value - len(existing_ids_set)}")
             
@@ -551,55 +608,73 @@ class ElasticsearchService:
                 logger.info("No missing documents found")
                 return
             
+            # Determine ID field name based on index
+            id_field = "id_ara" if index_to_search == "ara" else "id_edarehoquqy"
+            
+            # Determine source fields based on index
+            source_fields = ["id_ara", "content", "message", "documents", "metadata", "date", "title"] if index_to_search == "ara" else ["id_edarehoquqy", "question", "answer", "content", "metadata"]
+            
             # Query for documents that are NOT in the existing_ids_set
             query = {
                 "query": {
                     "bool": {
                         "must_not": {
                             "terms": {
-                                "id_edarehoquqy": list(existing_ids_set)
+                                id_field: list(existing_ids_set)
                             }
                         }
                     }
                 }, 
-                "_source": ["id_edarehoquqy", "question", "answer", "content", "metadata", "title", "summary"],
-                "size": 1000  # Fetch in batches
+                "_source": source_fields,
+                "size": 4000  # Fetch in larger batches to process more documents
             }
 
             # Get documents from elasticsearch using scroll API
             resp = await self.client.search(
-                index=self.index_name,
+                index=index_to_search,
                 body=query,
-                scroll="3m"
+                scroll="10m"  # Increase scroll time to handle larger batches
             )
             
             scroll_id = resp.get("_scroll_id")
             total_hits = resp["hits"]["total"]["value"]
             logger.info(f"Found {total_hits} documents not in the existing IDs list")
+            processed_count = 0
             
             try:
                 # Process initial batch
                 for hit in resp["hits"]["hits"]:
                     source = hit["_source"]
-                    # Ensure id_edarehoquqy exists
-                    if "id_edarehoquqy" not in source:
-                        source["id_edarehoquqy"] = hit.get("_id", "unknown_id")
+                    # Ensure ID field exists
+                    if id_field not in source:
+                        logger.warning(f"Document missing {id_field} field, skipping: {source.keys()}")
+                        continue
+                    
+                    processed_count += 1
                     yield source
                     
                 # Continue scrolling until all results are retrieved
                 while scroll_id and resp["hits"]["hits"]:
                     resp = await self.client.scroll(
                         scroll_id=scroll_id,
-                        scroll="3m"
+                        scroll="10m"  # Increase scroll time
                     )
                     scroll_id = resp.get("_scroll_id")
                     
                     for hit in resp["hits"]["hits"]:
                         source = hit["_source"]
-                        # Ensure id_edarehoquqy exists
-                        if "id_edarehoquqy" not in source:
-                            source["id_edarehoquqy"] = hit.get("_id", "unknown_id")
+                        
+                        # Ensure ID field exists
+                        if id_field not in source:
+                            logger.warning(f"Document missing {id_field} field, skipping: {source.keys()}")
+                            continue
+                        
+                        processed_count += 1
+                        if processed_count % 1000 == 0:
+                            logger.info(f"Processed {processed_count}/{total_hits} documents")
                         yield source
+                
+                logger.info(f"Finished processing all {processed_count} documents")
             except Exception as e:
                 logger.error(f"Error processing search results: {e}")
             finally:

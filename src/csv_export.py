@@ -3,7 +3,7 @@ import logging
 import aiofiles
 import asyncio
 import os
-from typing import List, Dict, Set
+from typing import List, Dict, Set, Optional, Union, Any
 from pathlib import Path
 from dotenv import load_dotenv
 from pydantic import Field, BaseModel
@@ -43,6 +43,102 @@ logger = logging.getLogger(__name__)
     }
 } 
 """
+
+class AraMetadata(BaseModel):
+    authority_type: str = Field(default="نامشخص")
+    branch: str = Field(default="")
+    final_judgment: str = Field(default="")
+    judge: str = Field(default="")
+    judgment_group: str = Field(default="نامشخص")
+    judgment_type: str = Field(default="نامشخص")
+    petition_date: str = Field(default="0001/01/01")
+    selected_document_judgment: Optional[Union[str, List[str]]] = Field(default=[])
+    session_number: str = Field(default="نامشخص")
+
+class AraDate(BaseModel):
+    georgian: str = Field(default="0001/01/01")
+    gregorian: str = Field(default="0001/01/01")
+    shamsi: str = Field(default="0001/01/01")
+
+class AraDocument(BaseModel):
+    id_ara: str
+    title: str = Field(default="")
+    content: str = Field(default="")
+    message: str = Field(default="")
+    documents: str = Field(default="")
+    summary: str = Field(default="")
+    date: AraDate = Field(default_factory=lambda: AraDate(shamsi="0001/01/01", georgian="0001/01/01", gregorian="0001/01/01"))
+    metadata: AraMetadata = Field(default_factory=lambda: AraMetadata())
+    
+    # Add compatibility with EdarehoquqyDocument for existing functions
+    @property
+    def id_edarehoquqy(self) -> str:
+        return self.id_ara
+    
+    @property
+    def question(self) -> str:
+        return self.title or self.message or ""
+    
+    @property
+    def answer(self) -> str:
+        return self.content or ""
+    
+    # Property for WordExporter compatibility
+    @property
+    def metadata_obj(self):
+        """
+        Return a properly formatted metadata object for WordExporter.
+        """
+        if not self.metadata:
+            return {}
+            
+        try:
+            # Use pydantic's model_dump or dict method to convert to dictionary
+            try:
+                meta_dict = self.metadata.model_dump()
+            except AttributeError:
+                # Fallback for older Pydantic versions
+                meta_dict = self.metadata.dict()
+                
+            # Add file_id for compatibility
+            meta_dict["file_id"] = self.id_ara
+            
+            # Ensure selected_document_judgment is a string if needed
+            if "selected_document_judgment" in meta_dict:
+                if meta_dict["selected_document_judgment"] is None:
+                    meta_dict["selected_document_judgment"] = ""
+                elif not isinstance(meta_dict["selected_document_judgment"], str):
+                    meta_dict["selected_document_judgment"] = str(meta_dict["selected_document_judgment"])
+                
+            return meta_dict
+        except Exception as e:
+            logger.warning(f"Error creating metadata dictionary: {e}")
+            return {}
+    
+    def model_dump(self) -> Dict[str, Any]:
+        return self.dict()
+    
+    def dict(self) -> Dict[str, Any]:
+        try:
+            date_dict = self.date.dict() if self.date else None
+        except Exception:
+            date_dict = {"georgian": None, "gregorian": None, "shamsi": "0001/01/01"}
+            
+        try:
+            metadata_dict = self.metadata.dict() if self.metadata else None
+        except Exception:
+            metadata_dict = None
+            
+        return {
+            "id_ara": self.id_ara,
+            "title": self.title,
+            "content": self.content,
+            "message": self.message,
+            "documents": self.documents,
+            "summary": self.summary,
+            "date": date_dict,
+            "metadata": metadata_dict
+        }
 class Metadata(BaseModel):
     file_id: str
     file_number: str
@@ -109,7 +205,7 @@ async def get_doc_title(client: AsyncOpenAI, doc: str) -> str:
 
     try:
         response = await client.chat.completions.create(
-            model="gpt-4.1-mini-2025-04-14",  # Using the more capable model for better title generation
+            model="gpt-4.1-mini",  # Using the more capable model for better title generation
             messages=[{"role": "user", "content": prompt}],
             response_format={"type": "json_object"},
             temperature=0.1  # Lower temperature for more focused, precise titles
@@ -142,7 +238,7 @@ async def get_each_doc_summary(client: AsyncOpenAI, doc: str) -> str:
     Documents provided are about Iranian Documents and law disputes and discussions.
     The output of your summary should be in Persian and will be read by Lawyers and Experts in the field.
     Education level of the audience is Master and PhD and your summary should be in a way that is easy to understand for them and capture the main points.
-    The summary should be in 150 words or less and must summarize the document in a way that is easy to understand for the audience.
+    The summary should be in 120 words or less and must summarize the document in a way that is easy to understand for the audience.
     Output should be in JSON format with only a "summary" field.
     
     Please summarize the following document:
@@ -150,20 +246,35 @@ async def get_each_doc_summary(client: AsyncOpenAI, doc: str) -> str:
     """
     try:
         response = await client.chat.completions.create(
-            model="gpt-4.1-mini-2025-04-14",
+            model="gpt-4.1-mini",
             messages=[{"role": "user", "content": prompt}],
             response_format={"type": "json_object"},
-            max_tokens=250,
+            max_tokens=200,  # Reduce to prevent truncation
             temperature=0.3
         )
         
         # Parse the JSON response and handle potential errors
         content = response.choices[0].message.content
-        parsed_content = json.loads(content)
-        return parsed_content.get("summary", "")
-    except json.JSONDecodeError as e:
-        logger.error(f"JSON parsing error: {e}, Content: {response.choices[0].message.content}")
-        raise
+        
+        # Check for truncated JSON
+        try:
+            parsed_content = json.loads(content)
+            return parsed_content.get("summary", "")
+        except json.JSONDecodeError:
+            # Handle truncated JSON by ensuring it's complete
+            logger.warning("Received potentially truncated JSON. Attempting to fix...")
+            
+            # Try to extract only the summary part using regex
+            import re
+            summary_match = re.search(r'"summary"\s*:\s*"([^"]+)', content)
+            if summary_match:
+                # Return just the extracted summary text
+                return summary_match.group(1)
+            
+            # If all else fails, return a safe default summary
+            logger.error(f"Could not parse summary from response: {content}")
+            raise
+            
     except Exception as e:
         logger.error(f"Error generating summary: {e}")
         raise

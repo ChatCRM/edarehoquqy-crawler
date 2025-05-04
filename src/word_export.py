@@ -3,7 +3,7 @@ import asyncio
 import json
 import os
 from aiopath import AsyncPath
-from typing import List, Dict, Tuple, Optional, AsyncGenerator, Set
+from typing import AsyncGenerator, List, Dict, Tuple, Optional, Set, Union
 from docx import Document
 from docxcompose.composer import Composer
 from docx.shared import Inches, Pt, RGBColor
@@ -14,7 +14,7 @@ from openai import AsyncOpenAI
 from dotenv import load_dotenv
 
 from src.elasticsearch_service import ElasticsearchService
-from src.csv_export import EdarehoquqyDocument
+from src.csv_export import AraDocument, EdarehoquqyDocument
 from src.html_converter import get_doc_title, get_each_doc_summary, get_all_existing_ids
 from src.html_export import save_html_file
 
@@ -69,6 +69,16 @@ class Loader:
                         logger.info(f"Found ID directory: {id_dir.name}")
                         existing_ids.add(id_dir.name)
         
+        uncategorized_dir = AsyncPath(os.path.join(str(self.root_dir), "بدون-دسته-بندی"))
+        if not await uncategorized_dir.exists():
+            logger.info(f"Uncategorized directory '{uncategorized_dir}' doesn't exist!")
+            return list(existing_ids)
+
+        # Add uncategorized IDs
+        async for id_dir in uncategorized_dir.iterdir():
+            if await id_dir.is_dir():
+                existing_ids.add(id_dir.name)
+
         logger.info(f"Total IDs found: {len(existing_ids)}")
         return list(existing_ids)
 
@@ -87,45 +97,50 @@ class Loader:
                 id_dirs.append(_dir)
         return id_dirs  # Return the list of directories, not the set of IDs
     
-    async def load_json_file(self, dir_path: AsyncPath) -> Optional[EdarehoquqyDocument]:
+    async def load_json_files(self, dir_path: AsyncPath, index_type: str = "edarehoquqy") -> AsyncGenerator[Union[EdarehoquqyDocument, AraDocument], None]:
         """Load a JSON file from an ID directory and convert it to EdarehoquqyDocument"""
         try:
             json_files = []
-            async for file in dir_path.glob("*.json"):
+            async for file in dir_path.glob("**/*.json"):
                 json_files.append(file)
                 
             if not json_files:
                 logger.warning(f"No JSON files found in {dir_path}")
-                return None
+                return  # Return without a value for an async generator
                 
-            # Use the first JSON file found
-            json_file = json_files[0]
-            async with aiofiles.open(json_file, mode='r', encoding='utf-8') as f:
-                data = await f.read()
-                json_data = json.loads(data)
-                return EdarehoquqyDocument(**json_data)
+            for file in json_files:
+                async with aiofiles.open(file, mode='r', encoding='utf-8') as f:
+                    data = await f.read()
+                    json_data = json.loads(data)
+                    if index_type == "edarehoquqy":
+                        yield EdarehoquqyDocument(**json_data)
+                    elif index_type == "ara":
+                        yield AraDocument(**json_data)
+                    else:
+                        logger.warning(f"Unknown index type: {index_type}")
+                        continue
         except json.JSONDecodeError:
             logger.error(f"Failed to decode JSON from {dir_path}")
             self._failed_files.add(str(dir_path))
-            return None
+            return  # Return without a value
         except Exception as e:
             logger.error(f"Error loading file from {dir_path}: {e}")
             self._failed_files.add(str(dir_path))
-            return None
+            return  # Return without a value
     
-    async def get_documents_by_keyword(self, keyword: str) -> AsyncGenerator[EdarehoquqyDocument, None]:
+    async def get_documents_by_keyword(self, keyword: str, index_type: str = "edarehoquqy") -> AsyncGenerator[Union[EdarehoquqyDocument, AraDocument], None]:
         """Get all documents for a specific keyword"""
         id_dirs = await self.get_id_dirs(keyword)
         for dir_path in id_dirs:
-            document = await self.load_json_file(dir_path)
-            if document:
-                # Add to categorized IDs set
-                self._categorized_ids.add(document.id_edarehoquqy)
-                yield document
+            if documents := await self.load_json_files(dir_path, index_type):
+                for document in documents:
+                    # Add to categorized IDs set
+                    self._categorized_ids.add(document.id_edarehoquqy)
+                    yield document
             else:
                 self._failed_ids.add(dir_path.name)
 
-    async def get_uncategorized_documents(self) -> AsyncGenerator[EdarehoquqyDocument, None]:
+    async def get_uncategorized_documents(self, index_type: str = "edarehoquqy") -> AsyncGenerator[Union[EdarehoquqyDocument, AraDocument], None]:
         """
         Get all documents that don't belong to any keyword category.
         
@@ -136,10 +151,11 @@ class Loader:
         try:
             # Now get all existing IDs from the root directory
             existing_ids = await self.get_all_existing_ids(str(self.root_dir))
-            logger.info(f"Existing IDs: {existing_ids}")
+            logger.info(f"Existing IDs: {len(existing_ids)}")
             
             # Process each uncategorized document
-            async for doc in self.elasticsearch_service.get_missing_documents(existing_ids):
+            processed_count = 0
+            async for doc in self.elasticsearch_service.get_missing_documents(existing_ids, index_type):
                 try:
                     # Ensure we have a proper dictionary before converting to EdarehoquqyDocument
                     if not isinstance(doc, dict):
@@ -154,15 +170,34 @@ class Loader:
                     # First convert to document object with whatever data we have
                     document = EdarehoquqyDocument(**doc)
                     
-                    # Then try to get title and summary if needed
-                    # These might be imported from html_converter or defined as fallbacks
+                    # Then try to get title and summary if needed - with retries
                     if not document.title or document.title == "":
-                        if title := await get_doc_title(self.openai_client, document.id_edarehoquqy):
-                            document.title = title
+                        # Try up to 3 times to get the title
+                        for attempt in range(3):
+                            try:
+                                if title := await get_doc_title(self.openai_client, f"Question: {document.question}\nAnswer: {document.answer}"):
+                                    document.title = title
+                                    break
+                            except Exception as e:
+                                logger.warning(f"Error getting title for document {document.id_edarehoquqy} (attempt {attempt+1}/3): {e}")
+                                if attempt < 2:  # Don't sleep after the last attempt
+                                    await asyncio.sleep(2)  # Brief pause before retry
                     
                     if not document.summary or document.summary == "":
-                        if summary := await get_each_doc_summary(self.openai_client, document.id_edarehoquqy):
-                            document.summary = summary
+                        # Try up to 3 times to get the summary
+                        for attempt in range(3):
+                            try:
+                                if summary := await get_each_doc_summary(self.openai_client, f"Question: {document.question}\nAnswer: {document.answer}"):
+                                    document.summary = summary
+                                    break
+                            except Exception as e:
+                                logger.warning(f"Error getting summary for document {document.id_edarehoquqy} (attempt {attempt+1}/3): {e}")
+                                if attempt < 2:  # Don't sleep after the last attempt
+                                    await asyncio.sleep(2)  # Brief pause before retry
+                    
+                    processed_count += 1
+                    if processed_count % 100 == 0:
+                        logger.info(f"Processed {processed_count} uncategorized documents so far")
                     
                     yield document
                 except Exception as e:
@@ -323,6 +358,163 @@ class WordExporter:
         
         return doc
     
+    def _create_ara_document(self, data: AraDocument, idx: int) -> Document:
+        """
+        Create a Word document specifically for ARA documents with professional formatting.
+        
+        Args:
+            data: ARA document data to format
+            idx: Index number for the document (for numbering)
+            
+        Returns:
+            Document: Formatted Word document
+        """
+        try:
+            doc = Document()
+            
+            # Set up styles
+            self._setup_styles(doc)
+            
+            # Add document number with centered alignment
+            doc_num_para = doc.add_paragraph(style='MetadataLabel')
+            doc_num_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            doc_num_para.add_run(f"Document #{idx}")
+            
+            # Add title with proper styling
+            title_text = data.title if hasattr(data, 'title') and data.title else "بدون عنوان"
+            title_para = doc.add_paragraph(style='CustomTitle')
+            title_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            title_para.add_run("Title: ").bold = True
+            title_para.add_run(title_text)
+            
+            # Add metadata section
+            metadata_section = doc.add_paragraph(style='MetadataLabel')
+            metadata_section.add_run('Document Metadata\n').bold = True
+            
+            # Add ID info
+            p = doc.add_paragraph(style='MetadataLabel')
+            p.add_run(f"ID: ").bold = True
+            p.add_run(data.id_ara if hasattr(data, 'id_ara') else "Unknown")
+            
+            # Add metadata fields
+            if hasattr(data, 'metadata_obj') and data.metadata_obj:
+                metadata = data.metadata_obj
+                
+                metadata_fields = {
+                    "authority_type": "نوع مرجع",
+                    "judgment_type": "نوع حکم",
+                    "judgment_group": "گروه حکم",
+                    "branch": "شعبه",
+                    "judge": "قاضی",
+                    "session_number": "شماره جلسه",
+                    "petition_date": "تاریخ دادخواست",
+                    "final_judgment": "حکم نهایی",
+                    "selected_document_judgment": "گزیده حکم"
+                }
+                
+                for field_key, field_label in metadata_fields.items():
+                    if field_key in metadata and metadata[field_key]:
+                        p = doc.add_paragraph(style='MetadataLabel')
+                        p.add_run(f"{field_label}: ").bold = True
+                        value = metadata[field_key]
+                        if isinstance(value, list):
+                            p.add_run(", ".join(str(item) for item in value))
+                        else:
+                            p.add_run(str(value))
+                
+                # Add date information if available
+                if hasattr(data, 'date') and data.date:
+                    if hasattr(data.date, 'shamsi') and data.date.shamsi and data.date.shamsi != "0001/01/01":
+                        p = doc.add_paragraph(style='MetadataLabel')
+                        p.add_run("تاریخ شمسی: ").bold = True
+                        p.add_run(data.date.shamsi)
+                    
+                    if hasattr(data.date, 'gregorian') and data.date.gregorian and data.date.gregorian != "0001/01/01":
+                        p = doc.add_paragraph(style='MetadataLabel')
+                        p.add_run("تاریخ میلادی: ").bold = True
+                        p.add_run(data.date.gregorian)
+            
+            # Add a small separator
+            separator = doc.add_paragraph(style='ContentText')
+            separator.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            separator.add_run('—' * 15)  # Smaller, more subtle separator
+            
+            # Add summary if available
+            if hasattr(data, 'summary') and data.summary:
+                doc.add_heading('Summary', level=2)
+                summary_para = doc.add_paragraph(style='ContentText')
+                summary_para.add_run(data.summary)
+            
+            # Add message section (specific to ARA documents)
+            if hasattr(data, 'message') and data.message:
+                doc.add_heading('Message', level=2)
+                message_para = doc.add_paragraph(style='ContentText')
+                message_para.add_run(data.message)
+            
+            # Add content section
+            if hasattr(data, 'content') and data.content:
+                doc.add_heading('Content', level=2)
+                content_para = doc.add_paragraph(style='ContentText')
+                content_para.add_run(data.content)
+            
+            # Add documents section if available
+            if hasattr(data, 'documents') and data.documents:
+                doc.add_heading('Documents', level=2)
+                docs_para = doc.add_paragraph(style='ContentText')
+                docs_para.add_run(data.documents)
+            
+            # Add page break at the end
+            doc.add_page_break()
+            
+            return doc
+        except Exception as e:
+            logger.error(f"Error creating ARA document: {e}")
+            import traceback
+            logger.error(f"ARA document creation error details: {traceback.format_exc()}")
+            
+            # Create a minimal valid document to avoid breaking the process
+            doc = Document()
+            doc.add_paragraph(f"Error creating ARA document {idx}: {str(e)}")
+            doc.add_page_break()
+            return doc
+    
+    async def export_ara_keyword_docs(self, keyword: str) -> Optional[str]:
+        """Export all documents for a keyword to a single Word document"""
+        try:
+            # Create an empty document with styles
+            master_doc = Document()
+            self._setup_styles(master_doc)
+            composer = Composer(master_doc)
+            
+            # Counter to track if we added any documents
+            doc_count = 0
+            
+            # Process each document for this keyword
+            async for data in self.file_loader.get_documents_by_keyword(keyword, index_type="ara"):
+                doc = self._create_ara_document(data, doc_count + 1)
+                composer.append(doc)
+                doc_count += 1
+            
+            # Determine the output path
+            if self.output_dir:
+                # Use specified output directory
+                output_path = os.path.join(self.output_dir, f"{keyword}.docx")
+            else:
+                # Save in the keyword directory
+                output_path = os.path.join(str(self.file_loader.root_dir), keyword, f"{keyword}.docx")  
+                
+            # Ensure directory exists
+            os.makedirs(os.path.dirname(output_path), exist_ok=True)
+            
+            # Save the document
+            composer.save(output_path)
+            logger.info(f"Saved combined document for '{keyword}' with {doc_count} documents to {output_path}")
+
+            return output_path
+        except Exception as e:
+            logger.error(f"Error creating Word document for keyword '{keyword}': {e}")
+            return None
+        
     async def export_keyword_to_word(self, keyword: str) -> Optional[str]:
         """Export all documents for a keyword to a single Word document"""
         try:
@@ -365,9 +557,19 @@ class WordExporter:
             logger.error(f"Error creating Word document for keyword '{keyword}': {e}")
             return None
 
-    async def export_uncategorized_documents(self) -> Optional[str]:
-        """Export all uncategorized documents to a single Word document and also create HTML files"""
+    async def export_uncategorized_documents(self, index_type: str = "edarehoquqy") -> Optional[str]:
+        """
+        Export all uncategorized documents to a single Word document and also create HTML files
+        
+        Args:
+            index_type: Type of index to process ('edarehoquqy' or 'ara')
+            
+        Returns:
+            Path to the saved Word document if successful, None otherwise
+        """
         try:
+            logger.info(f"Exporting uncategorized documents for index type: {index_type}")
+            
             # Create an empty document with styles
             master_doc = Document()
             self._setup_styles(master_doc)
@@ -382,7 +584,7 @@ class WordExporter:
             # Make the directory for JSON/HTML files
             uncategorized_dir = os.path.join(str(self.file_loader.root_dir), uncategorized_keyword)
             os.makedirs(uncategorized_dir, exist_ok=True)
-            
+        
             # Determine the output path for Word document
             if self.output_dir:
                 # Use specified output directory
@@ -392,27 +594,42 @@ class WordExporter:
                 output_path = os.path.join(uncategorized_dir, f"{uncategorized_keyword}.docx")
             
             # Process each uncategorized document
-            async for data in self.file_loader.get_uncategorized_documents():
-                # Add to Word document
-                doc = self._create_document(data, doc_count + 1)
-                composer.append(doc)
-                doc_count += 1
-                
-                # Create directory for this document's files
-                doc_dir = AsyncPath(uncategorized_dir) / data.id_edarehoquqy
-                await doc_dir.mkdir(exist_ok=True)
-                
-                # Save JSON file
-                json_path = doc_dir / f"{data.id_edarehoquqy}.json"
-                async with aiofiles.open(json_path, mode="w", encoding="utf-8") as file:
-                    await file.write(json.dumps(data.model_dump(), ensure_ascii=False, indent=4))
-                    
-                # Save HTML file
+            async for data in self.file_loader.get_uncategorized_documents(index_type):
                 try:
-                    await save_html_file(data, doc_dir)
-                    logger.info(f"Saved HTML file for document {data.id_edarehoquqy}")
+                    # Determine document type based on attributes
+                    is_ara_document = hasattr(data, 'id_ara') and not hasattr(data, 'id_edarehoquqy')
+                    
+                    # Add to Word document using appropriate method
+                    if index_type == "ara" or is_ara_document:
+                        doc = self._create_ara_document(data, doc_count + 1)
+                        doc_id = data.id_ara
+                    else:
+                        doc = self._create_document(data, doc_count + 1)
+                        doc_id = data.id_edarehoquqy
+                    
+                    composer.append(doc)
+                    doc_count += 1
+                    
+                    # Create directory for this document's files
+                    doc_dir = AsyncPath(uncategorized_dir) / doc_id
+                    await doc_dir.mkdir(exist_ok=True)
+                    
+                    # Save JSON file
+                    json_path = doc_dir / f"{doc_id}.json"
+                    async with aiofiles.open(json_path, mode="w", encoding="utf-8") as file:
+                        await file.write(json.dumps(data.model_dump(), ensure_ascii=False, indent=4))
+                        
+                    # Save HTML file
+                    try:
+                        await save_html_file(data, doc_dir)
+                        logger.info(f"Saved HTML file for document {doc_id}")
+                    except Exception as e:
+                        logger.error(f"Error saving HTML file for {doc_id}: {e}")
                 except Exception as e:
-                    logger.error(f"Error saving HTML file for {data.id_edarehoquqy}: {e}")
+                    logger.error(f"Error processing uncategorized document: {e}")
+                    import traceback
+                    logger.error(f"Error details: {traceback.format_exc()}")
+                    continue
             
             # Skip empty documents
             if doc_count == 0:
@@ -423,25 +640,66 @@ class WordExporter:
             os.makedirs(os.path.dirname(output_path), exist_ok=True)
             
             # Save the document
-            composer.save(output_path)
-            logger.info(f"Saved combined document for uncategorized documents with {doc_count} documents to {output_path}")
-            
-            return output_path
+            try:
+                composer.save(output_path)
+                logger.info(f"Saved combined document for uncategorized documents with {doc_count} documents to {output_path}")
+                return output_path
+            except Exception as e:
+                logger.error(f"Error saving uncategorized documents to {output_path}: {e}")
+                import traceback
+                logger.error(f"Save error details: {traceback.format_exc()}")
+                return None
         except Exception as e:
             logger.error(f"Error creating Word document for uncategorized documents: {e}")
+            import traceback
+            logger.error(f"Error details: {traceback.format_exc()}")
             return None
-            
-    async def export_all_keywords(self) -> Dict[str, str]:
-        """Export all keywords to separate Word documents"""
-        results = {}
-        keywords = await self.file_loader.get_keywords()
+    
+    async def export_all_keywords(self, limit: int = None, index_type: str = "edarehoquqy") -> Dict[str, str]:
+        """Export all keywords to separate Word documents
         
-        for keyword in keywords:
-            output_path = await self.export_keyword_to_word(keyword)
-            if output_path:
-                results[keyword] = output_path
+        Args:
+            limit: Optional limit on the number of keywords to process
+            index_type: Type of index to process ('edarehoquqy' or 'ara')
+            
+        Returns:
+            Dictionary mapping keywords to saved Word document paths
+        """
+        results = {}
+        logger.info(f"Starting export of keywords with index type: {index_type}")
+        
+        try:
+            # Get all keywords
+            keywords = await self.file_loader.get_keywords()
+            logger.info(f"Found {len(keywords)} keywords to process")
+            
+            # Apply limit if provided
+            if limit:
+                logger.info(f"Limiting to first {limit} keywords")
+                keywords = keywords[:limit]
+            
+            # Process each keyword and save its document
+            for i, keyword in enumerate(keywords):
+                logger.info(f"Processing keyword {i+1}/{len(keywords)}: '{keyword}'")
+                if index_type == "ara":
+                    output_path = await self.export_ara_keyword_docs(keyword)
+                else:
+                    output_path = await self.export_keyword_to_word(keyword)
                 
-        return results
+                if output_path:
+                    logger.info(f"Successfully exported keyword '{keyword}' to {output_path}")
+                    results[keyword] = output_path
+                else:
+                    logger.warning(f"Failed to export keyword '{keyword}'")
+            
+            logger.info(f"Successfully exported {len(results)} of {len(keywords)} keywords to Word documents")
+            return results
+            
+        except Exception as e:
+            logger.error(f"Error in export_all_keywords: {e}")
+            import traceback
+            logger.error(f"Error details: {traceback.format_exc()}")
+            return results  # Return whatever results we have so far
 
 
 async def main():
