@@ -229,7 +229,7 @@ class Loader:
 
 
 class WordExporter:
-    def __init__(self, file_loader: Loader, output_dir: str = None, max_docs_per_file: int = 2):
+    def __init__(self, file_loader: Loader, output_dir: str = None, max_docs_per_file: int = 999):
         """
         Initialize a WordExporter to export documents to Word files.
         
@@ -874,7 +874,7 @@ async def main():
     # Define search directory in current working directory
     # search_dir = os.path.join(os.getcwd(), "search")
     # Use absolute path instead
-    search_dir = "/home/msc8/Documents/search"
+    search_dir = "/home/sadeghian/edarehoquqy/html-outputls/search"
     
     # Create the directory if it doesn't exist
     if not os.path.exists(search_dir):

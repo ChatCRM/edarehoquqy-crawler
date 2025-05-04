@@ -825,7 +825,7 @@ async def convert_and_save_ara_documents(exporter: WordExporter, query_list: Lis
     try:
         # Process each document
         previous_query = query_list[0]
-        async for doc_data, query in get_data_from_ara(query_list, client, str(output_dir), max_results=5):
+        async for doc_data, query in get_data_from_ara(query_list, client, str(output_dir)):
             document_counter += 1
             
             try:
@@ -993,8 +993,7 @@ async def main():
     
     args = parser.parse_args()
     
-    
-    query_list = args.queries if args.queries else QUERY_LIST_V1[:2]
+    query_list = args.queries if args.queries else QUERY_LIST_V1
     
     # Clear existing directories if requested
     if args.clear_existing:
