@@ -17,7 +17,7 @@ import traceback
 import base64
 
 from src.csv_export import AraMetadata, AraDate, AraDocument, EdarehoquqyDocument, get_each_doc_summary, get_doc_title
-from src.html_converter import get_query_keywords, get_all_existing_ids, QUERY_LIST_V1
+from src.html_converter import get_query_keywords, QUERY_LIST_V1
 from src.elasticsearch_service import ElasticsearchService
 from src.word_export import WordExporter, Loader
 
@@ -76,15 +76,18 @@ class AraLoader(Loader):
         doc_count = 0
         
         for dir_path in id_dirs:
+            documents_found = False
             async for document in self.load_json_file(dir_path):
                 if document:
+                    documents_found = True
                     # Add to categorized IDs set
                     self._categorized_ids.add(document.id_ara)
                     doc_count += 1
                     if doc_count % 10 == 0:
                         logger.info(f"Processed {doc_count} documents so far for keyword '{keyword}'")
-                yield document
-            else:
+                    yield document
+            
+            if not documents_found:
                 logger.warning(f"Failed to load document from directory: {dir_path}")
                 self._failed_ids.add(dir_path.name)
         
@@ -258,6 +261,55 @@ def convert_to_ara_document(doc_data: Dict[str, Any]) -> AraDocument:
         return AraDocument(id_ara=doc_data.get("id_ara", "unknown_id"))
 
 
+async def get_all_existing_ara_ids(output_dir: str) -> Dict[str, AsyncPath]:
+    """
+    Get all existing ARA document IDs from the output directory.
+    
+    Args:
+        output_dir: Path to the output directory
+        
+    Returns:
+        Dict of existing document IDs and their corresponding file paths
+    """
+    existing_ids = {}
+    output_path = AsyncPath(output_dir)
+    
+    if not await output_path.exists():
+        logger.info(f"Output directory {output_dir} does not exist")
+        return existing_ids
+        
+    # First look for files directly in keyword subdirectories
+    async for keyword_dir in output_path.glob('*'):
+        if not await keyword_dir.is_dir() or keyword_dir.name.startswith('.'):
+            continue
+            
+        logger.info(f"Scanning keyword directory: {keyword_dir}")
+        async for id_dir in keyword_dir.glob('*'):
+            if not await id_dir.is_dir() or id_dir.name.startswith('.'):
+                continue
+                
+            # Extract ID from directory name
+            id_ara = id_dir.name
+            if id_ara not in existing_ids:
+                existing_ids[id_ara] = id_dir
+                
+    # Also check the uncategorized directory if it exists
+    uncategorized_dir = AsyncPath(os.path.join(output_dir, "بدون-دسته-بندی"))
+    if await uncategorized_dir.exists():
+        logger.info(f"Scanning uncategorized directory: {uncategorized_dir}")
+        async for id_dir in uncategorized_dir.glob('*'):
+            if not await id_dir.is_dir() or id_dir.name.startswith('.'):
+                continue
+                
+            # Extract ID from directory name
+            id_ara = id_dir.name
+            if id_ara not in existing_ids:
+                existing_ids[id_ara] = id_dir
+    
+    logger.info(f"Found {len(existing_ids)} existing ARA document IDs")
+    return existing_ids
+
+
 async def get_data_from_ara(query_list: List[str], client: AsyncOpenAI, output_dir: str = "../ara-output", max_results: int = None) -> AsyncGenerator[Tuple[AraDocument, str], None]:
     """
     Retrieve documents from Elasticsearch ARA index based on query list.
@@ -279,7 +331,7 @@ async def get_data_from_ara(query_list: List[str], client: AsyncOpenAI, output_d
         username = os.getenv("ELASTICSEARCH_USERNAME")
 
         processed_files = set()
-        existing_ids = await get_all_existing_ids(output_dir)
+        existing_ids = await get_all_existing_ara_ids(output_dir)
         
         # Create ES service
         es_service = ElasticsearchService(
@@ -825,7 +877,7 @@ async def convert_and_save_ara_documents(exporter: WordExporter, query_list: Lis
     try:
         # Process each document
         previous_query = query_list[0]
-        async for doc_data, query in get_data_from_ara(query_list, client, str(output_dir)):
+        async for doc_data, query in get_data_from_ara(query_list, client, str(output_dir), max_results=4):
             document_counter += 1
             
             try:
@@ -993,7 +1045,7 @@ async def main():
     
     args = parser.parse_args()
     
-    query_list = args.queries if args.queries else QUERY_LIST_V1
+    query_list = args.queries if args.queries else QUERY_LIST_V1[:5]
     
     # Clear existing directories if requested
     if args.clear_existing:
