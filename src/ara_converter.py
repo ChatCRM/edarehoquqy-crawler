@@ -12,6 +12,7 @@ import aiofiles
 from aiopath import AsyncPath
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
+import copy
 import traceback
 import base64
 
@@ -257,7 +258,7 @@ def convert_to_ara_document(doc_data: Dict[str, Any]) -> AraDocument:
         return AraDocument(id_ara=doc_data.get("id_ara", "unknown_id"))
 
 
-async def get_data_from_ara(query_list: List[str], client: AsyncOpenAI, output_dir: str = "../ara-output") -> AsyncGenerator[Tuple[AraDocument, str], None]:
+async def get_data_from_ara(query_list: List[str], client: AsyncOpenAI, output_dir: str = "../ara-output", max_results: int = None) -> AsyncGenerator[Tuple[AraDocument, str], None]:
     """
     Retrieve documents from Elasticsearch ARA index based on query list.
     
@@ -312,7 +313,6 @@ async def get_data_from_ara(query_list: List[str], client: AsyncOpenAI, output_d
                 elif num_phrases > 2:
                     min_score = 2.5
                 
-                max_results = None
                 
                 # Execute search
                 async for batch in es_service.search_by_text_batch(
@@ -793,7 +793,7 @@ async def create_ara_html(doc: AraDocument, font_path: Optional[Path] = None) ->
     
     return html_content
 
-async def convert_and_save_ara_documents(query_list: List[str], output_dir: Path, client: AsyncOpenAI = None) -> List[Path]:
+async def convert_and_save_ara_documents(exporter: WordExporter, query_list: List[str], output_dir: Path, client: AsyncOpenAI = None) -> List[Path]:
     """
     Convert and save documents from ARA index to HTML files.
     
@@ -824,7 +824,8 @@ async def convert_and_save_ara_documents(query_list: List[str], output_dir: Path
     
     try:
         # Process each document
-        async for doc_data, query in get_data_from_ara(query_list, client, str(output_dir)):
+        previous_query = query_list[0]
+        async for doc_data, query in get_data_from_ara(query_list, client, str(output_dir), max_results=5):
             document_counter += 1
             
             try:
@@ -833,19 +834,47 @@ async def convert_and_save_ara_documents(query_list: List[str], output_dir: Path
                 os.makedirs(query_dir, exist_ok=True)
                 
                 # Save document as HTML and JSON
-                html_path, json_path = await save_ara_document(doc_data, query_dir, font_path=font_path)
+                html_path, _ = await save_ara_document(doc_data, query_dir, font_path=font_path)
                 
                 saved_files.append(html_path)
                 logger.info(f"Saved document {document_counter} as HTML: {html_path}")
+
+                # Export Word documents for each new query we encounter
+                if previous_query != query:
+                    logger.info(f"Exporting Word documents for query: {query}")
+                    word_paths = await exporter.export_documents_by_keyword(query, index_type="ara")
+                    if word_paths:
+                        logger.info(f"Successfully exported Word documents for '{query}': {word_paths}")
+                    else:
+                        logger.warning(f"Failed to export Word documents for '{query}'")
+                    previous_query = query
                 
             except Exception as e:
                 logger.error(f"Error processing document {doc_data.id_ara}: {e}")
                 failed_ids.add(doc_data.id_ara)
                 import traceback
                 logger.error(traceback.format_exc())
-    
+        
+        if previous_query != query_list[-1]:
+            logger.info(f"Exporting Word documents for query: {query_list[-1]}")
+            word_paths = await exporter.export_documents_by_keyword(query_list[-1], index_type="ara")
+            if word_paths:
+                logger.info(f"Successfully exported Word documents for '{query_list[-1]}': {word_paths}")
+            else:
+                logger.warning(f"Failed to export Word documents for '{query_list[-1]}'")
+        
+        if previous_query == query_list[0]:
+            logger.info(f"Exporting Word documents for query: {query_list[0]}")
+            word_paths = await exporter.export_documents_by_keyword(query_list[0], index_type="ara")
+            if word_paths:
+                logger.info(f"Successfully exported Word documents for '{query_list[0]}': {word_paths}")
+            else:
+                logger.warning(f"Failed to export Word documents for '{query_list[0]}'")
+        
         if not saved_files:
             logger.warning("No documents were retrieved from ARA index. Check your queries and connection settings.")
+        
+            
         
         # Save failed IDs to a file for later reference
         if failed_ids:
@@ -907,28 +936,24 @@ async def process_ara_index(query_list: List[str], output_base_dir: str = None, 
         uncategorized_dir = os.path.join(html_output_dir, "بدون-دسته-بندی")
         os.makedirs(uncategorized_dir, exist_ok=True)
         
-        # Step 1: Convert documents to HTML
-        logger.info(f"Starting conversion of ARA documents to HTML for queries: {query_list}")
-        saved_files = await convert_and_save_ara_documents(query_list, html_output_dir, client)
-        logger.info(f"Saved {len(saved_files)} HTML files")
-    
-        # Step 2: Export to Word documents
-        logger.info("Starting export to Word documents")
-        
-        # Initialize services
         async with ElasticsearchService(
             hosts=hosts, 
             username=username, 
             password=password, 
             index_name="ara"
         ) as es:
-            await es.ensure_index_exists()
-            
             # Create AraLoader instance
             loader = AraLoader(html_output_dir, es, client)
-            
             # Create WordExporter
             exporter = WordExporter(loader, word_output_dir)
+
+            # Step 1: Convert documents to HTML
+            logger.info(f"Starting conversion of ARA documents to HTML for queries: {query_list}")
+            saved_files = await convert_and_save_ara_documents(exporter, query_list, html_output_dir, client)
+            logger.info(f"Saved {len(saved_files)} HTML files")
+        
+            # Initialize services
+            await es.ensure_index_exists()
             
             # Export uncategorized documents
             logger.info("Exporting uncategorized documents")
@@ -969,7 +994,7 @@ async def main():
     args = parser.parse_args()
     
     
-    query_list = args.queries if args.queries else QUERY_LIST_V1[:1]
+    query_list = args.queries if args.queries else QUERY_LIST_V1[:2]
     
     # Clear existing directories if requested
     if args.clear_existing:

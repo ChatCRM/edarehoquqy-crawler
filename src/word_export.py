@@ -85,7 +85,9 @@ class Loader:
 
     async def get_id_dirs(self, keyword: str) -> List[AsyncPath]:
         """Get all ID directories within a keyword directory"""
-        keyword_path = self.root_dir / keyword
+        # Convert spaces to underscores to match directory naming convention
+        formatted_keyword = keyword.replace('/', '_').replace(' ', '_')
+        keyword_path = self.root_dir / formatted_keyword
         if not await keyword_path.exists():
             logger.error(f"Keyword directory {keyword_path} does not exist")
             return []
@@ -93,12 +95,13 @@ class Loader:
         id_dirs = []
         async for _dir in keyword_path.glob("*"):
             if await _dir.is_dir() and not _dir.name.startswith('.'):
-                self._all_doc_ids.add(_dir.name)  # Use add() for sets, not append()
+                self._all_doc_ids.add(_dir.name)  
                 id_dirs.append(_dir)
-        return id_dirs  # Return the list of directories, not the set of IDs
+        logger.info(f"Found {len(id_dirs)} ID directories for keyword: {keyword}")
+        return id_dirs  
     
     async def load_json_files(self, dir_path: AsyncPath, index_type: str = "edarehoquqy") -> AsyncGenerator[Union[EdarehoquqyDocument, AraDocument], None]:
-        """Load a JSON file from an ID directory and convert it to EdarehoquqyDocument"""
+        """Load JSON files from an ID directory and convert them to document objects based on index type"""
         try:
             json_files = []
             async for file in dir_path.glob("**/*.json"):
@@ -106,27 +109,30 @@ class Loader:
                 
             if not json_files:
                 logger.warning(f"No JSON files found in {dir_path}")
-                return  # Return without a value for an async generator
+                return
                 
             for file in json_files:
-                async with aiofiles.open(file, mode='r', encoding='utf-8') as f:
-                    data = await f.read()
-                    json_data = json.loads(data)
-                    if index_type == "edarehoquqy":
-                        yield EdarehoquqyDocument(**json_data)
-                    elif index_type == "ara":
-                        yield AraDocument(**json_data)
-                    else:
-                        logger.warning(f"Unknown index type: {index_type}")
-                        continue
-        except json.JSONDecodeError:
-            logger.error(f"Failed to decode JSON from {dir_path}")
-            self._failed_files.add(str(dir_path))
-            return  # Return without a value
+                try:
+                    async with aiofiles.open(file, mode='r', encoding='utf-8') as f:
+                        data = await f.read()
+                        json_data = json.loads(data)
+                        if index_type == "edarehoquqy":
+                            logger.info(f"Loading EdarehoquqyDocument from {file}")
+                            yield EdarehoquqyDocument(**json_data)
+                        elif index_type == "ara":
+                            yield AraDocument(**json_data)
+                        else:
+                            logger.warning(f"Unknown index type: {index_type}")
+                            continue
+                except json.JSONDecodeError:
+                    logger.error(f"Failed to decode JSON from {file}")
+                    self._failed_files.add(str(file))
+                except Exception as e:
+                    logger.error(f"Error loading file {file}: {e}")
+                    self._failed_files.add(str(file))
         except Exception as e:
-            logger.error(f"Error loading file from {dir_path}: {e}")
+            logger.error(f"Error accessing directory {dir_path}: {e}")
             self._failed_files.add(str(dir_path))
-            return  # Return without a value
     
     async def get_documents_by_keyword(self, keyword: str, index_type: str = "edarehoquqy") -> AsyncGenerator[Union[EdarehoquqyDocument, AraDocument], None]:
         """Get all documents for a specific keyword"""
@@ -223,7 +229,7 @@ class Loader:
 
 
 class WordExporter:
-    def __init__(self, file_loader: Loader, output_dir: str = None, max_docs_per_file: int = 20):
+    def __init__(self, file_loader: Loader, output_dir: str = None, max_docs_per_file: int = 2):
         """
         Initialize a WordExporter to export documents to Word files.
         
@@ -830,6 +836,29 @@ class WordExporter:
             import traceback
             logger.error(f"Error details: {traceback.format_exc()}")
             return results  # Return whatever results we have so far
+
+    async def export_documents_by_keyword(self, keyword: str, index_type: str = "edarehoquqy") -> Optional[List[str]]:
+        """Export all documents for a specific keyword to Word documents
+        
+        Args:
+            keyword: The keyword to export documents for
+            index_type: Type of index to process ('edarehoquqy' or 'ara')
+            
+        Returns:
+            List of paths to the saved Word documents if successful, None otherwise
+        """
+        logger.info(f"Exporting documents for keyword '{keyword}' with index type '{index_type}'")
+        
+        try:
+            if index_type == "ara":
+                return await self.export_ara_keyword_docs(keyword)
+            else:
+                return await self.export_keyword_to_word(keyword)
+        except Exception as e:
+            logger.error(f"Error exporting documents for keyword '{keyword}': {e}")
+            import traceback
+            logger.error(f"Error details: {traceback.format_exc()}")
+            return None
 
 
 async def main():
